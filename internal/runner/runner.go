@@ -16,13 +16,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/config"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/convlog"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/emit"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/index"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/ratelimit"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/slot"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/watchdog"
+	"github.com/rengotaku/agy-run/internal/config"
+	"github.com/rengotaku/agy-run/internal/convlog"
+	"github.com/rengotaku/agy-run/internal/emit"
+	"github.com/rengotaku/agy-run/internal/index"
+	"github.com/rengotaku/agy-run/internal/ratelimit"
+	"github.com/rengotaku/agy-run/internal/slot"
+	"github.com/rengotaku/agy-run/internal/watchdog"
 )
 
 // timeNow is overridable in tests; production uses the wall clock.

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/config"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/emit"
+	"github.com/rengotaku/agy-run/internal/config"
+	"github.com/rengotaku/agy-run/internal/emit"
 )
 
 // parseResult decodes the single JSON result object agy-run writes to stdout.

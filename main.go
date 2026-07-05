@@ -15,9 +15,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/config"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/emit"
-	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/runner"
+	"github.com/rengotaku/agy-run/internal/config"
+	"github.com/rengotaku/agy-run/internal/emit"
+	"github.com/rengotaku/agy-run/internal/runner"
 )
 
 const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go 版)。
