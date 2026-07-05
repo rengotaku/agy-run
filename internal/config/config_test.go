@@ -126,6 +126,71 @@ func TestDurationToSec(t *testing.T) {
 	}
 }
 
+func TestParseWorkspaceShortAndLong(t *testing.T) {
+	for _, argv := range [][]string{
+		{"-W", "/repo/main", "go"},
+		{"--workspace", "/repo/main", "go"},
+		{"--workspace=/repo/main", "go"},
+	} {
+		cfg, _, err := Parse(argv, mapEnv(nil))
+		if err != nil {
+			t.Fatalf("%v: %v", argv, err)
+		}
+		if cfg.Workspace != "/repo/main" {
+			t.Errorf("%v: workspace = %q", argv, cfg.Workspace)
+		}
+		if cfg.Prompt != "go" {
+			t.Errorf("%v: prompt = %q", argv, cfg.Prompt)
+		}
+	}
+}
+
+func TestParseWaitQuota(t *testing.T) {
+	cfg, _, err := Parse([]string{"--wait-quota", "do"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WaitQuota {
+		t.Error("wait_quota not set")
+	}
+	if cfg.MaxQuotaWait != DefaultMaxQuotaWait {
+		t.Errorf("max_quota_wait = %d, want %d", cfg.MaxQuotaWait, DefaultMaxQuotaWait)
+	}
+}
+
+func TestParseLongModel(t *testing.T) {
+	cfg, _, err := Parse([]string{"--model", "Gemini 3.5 Flash (High),Gemini 3.1 Pro (High)", "x"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cfg.Models(), []string{"Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (High)"}) {
+		t.Errorf("models = %v", cfg.Models())
+	}
+}
+
+func TestModelsList(t *testing.T) {
+	cases := map[string][]string{
+		"":              {""},
+		"   ":           {""},
+		"A":             {"A"},
+		"A,B":           {"A", "B"},
+		" A , B ,":      {"A", "B"},
+		"Gemini 3.5, X": {"Gemini 3.5", "X"},
+	}
+	for in, want := range cases {
+		got := Config{Model: in}.Models()
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("Models(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestParseUnknownLongOption(t *testing.T) {
+	if _, _, err := Parse([]string{"--bogus", "x"}, mapEnv(nil)); err == nil {
+		t.Error("expected error for unknown long option")
+	}
+}
+
 func TestGetoptsClusterAndAttached(t *testing.T) {
 	opts, rest, err := getopts([]string{"-cd", "-t300", "prompt"}, "t:m:cC:w:da:h")
 	if err != nil {

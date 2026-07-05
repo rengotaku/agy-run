@@ -21,12 +21,17 @@ import (
 	"github.com/rengotaku/agy-run/internal/emit"
 	"github.com/rengotaku/agy-run/internal/index"
 	"github.com/rengotaku/agy-run/internal/ratelimit"
+	"github.com/rengotaku/agy-run/internal/runcmd"
 	"github.com/rengotaku/agy-run/internal/slot"
 	"github.com/rengotaku/agy-run/internal/watchdog"
+	"github.com/rengotaku/agy-run/internal/workspace"
 )
 
-// timeNow is overridable in tests; production uses the wall clock.
-var timeNow = time.Now
+// timeNow and sleepFor are overridable in tests; production uses the wall clock.
+var (
+	timeNow  = time.Now
+	sleepFor = time.Sleep
+)
 
 // Options are the runtime dependencies (injected for testability).
 type Options struct {
@@ -45,19 +50,23 @@ func Run(cfg config.Config, opt Options) int {
 	// a fresh machine (agy normally creates it, but do not depend on that).
 	_ = os.MkdirAll(paths.StateDir, 0o755)
 
-	// Guard 0: validate -m against the authoritative `agy models` list so a
-	// wrong model name fails fast (with the valid options in the result) instead
-	// of silently running on agy's fallback model. Best-effort: if the list
-	// cannot be obtained we skip validation and pass the name through.
+	// Guard 0: validate every -m candidate against the authoritative
+	// `agy models` list so a wrong model name fails fast (with the valid options
+	// in the result) instead of silently running on agy's fallback model.
+	// Best-effort: if the list cannot be obtained we skip validation.
 	if cfg.Model != "" {
-		if models, ok := listModels(paths.AgyBin); ok && !contains(models, cfg.Model) {
-			e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
-				Reason:          "unknown_model",
-				Detail:          cfg.Model,
-				AvailableModels: models,
-				Hint:            `-m は agy models の名称と完全一致が必要（例: "Gemini 3.5 Flash (High)"）。`,
-			}})
-			return config.ExitUsage
+		if models, ok := listModels(paths.AgyBin); ok {
+			for _, m := range cfg.Models() {
+				if m != "" && !contains(models, m) {
+					e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+						Reason:          "unknown_model",
+						Detail:          m,
+						AvailableModels: models,
+						Hint:            `-m は agy models の名称と完全一致が必要（例: "Gemini 3.5 Flash (High)"）。カンマ区切りでフォールバック候補を並べられます。`,
+					}})
+					return config.ExitUsage
+				}
+			}
 		}
 	}
 
@@ -97,13 +106,68 @@ func cooldown(e *emit.Emitter, killStamp string) {
 	}
 }
 
-// execute runs agy under the watchdog and emits the single-object result.
+// execute drives the model-fallback / quota-wait loop around attempt() and
+// emits the single result object exactly once. All physical agy runs happen
+// inside the already-acquired concurrency slot; only rate_limited triggers a
+// retry (fall to the next -m candidate, then optionally wait out the quota).
 func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
+	preflight := workspace.Preflight(effectiveWorkDir(cfg), paths.Settings)
+
+	models := cfg.Models()
+	waited := false
+	for i := 0; ; {
+		model := models[i]
+		r, rc, logFile := attempt(cfg, model, opt, e, paths)
+
+		if rc == config.ExitRateLimited {
+			// Model fallback: try the next candidate from -m "A,B,...".
+			if i < len(models)-1 {
+				e.Note(fmt.Sprintf("rate_limited: %s が上限。次候補 %s で再試行します。",
+					modelLabel(model), modelLabel(models[i+1])))
+				i++
+				continue
+			}
+			// Quota-reset wait (opt-in, once, bounded).
+			if cfg.WaitQuota && !waited {
+				if d, ok := ratelimit.ResetWait(logFile); ok {
+					limit := time.Duration(cfg.MaxQuotaWait) * time.Second
+					if d <= limit {
+						e.Note(fmt.Sprintf("--wait-quota: リセットまで %s 待機して再試行します。", d))
+						sleepFor(d)
+						waited = true
+						if r.Error != nil {
+							r.Error.WaitedSec = int(d.Seconds())
+						}
+						continue
+					}
+					e.Note(fmt.Sprintf("--wait-quota: リセット待ち %s が上限 %s を超過。待機せず rate_limited を返します。", d, limit))
+				}
+			}
+			// Exhausted: annotate what was tried so the caller can decide.
+			if r.Error != nil {
+				if tried := nonEmpty(models); len(tried) > 1 {
+					r.Error.ModelsTried = tried
+				}
+			}
+		}
+
+		r.Warnings = prependWarning(r.Warnings, preflight)
+		for _, w := range r.Warnings {
+			e.Note("warning: " + w)
+		}
+		e.Emit(r)
+		return rc
+	}
+}
+
+// attempt runs agy once on the given model under the watchdog, records the
+// invocation in index.jsonl, and returns the assembled result plus the resolved
+// exit code and log path. It never emits the contract object — execute() owns
+// the single stdout write so retries do not duplicate it. Stall/timeout log
+// tails still go to stderr here, since they are per-physical-run diagnostics.
+func attempt(cfg config.Config, model string, opt Options, e *emit.Emitter, paths Paths) (emit.Result, int, string) {
 	if err := os.MkdirAll(paths.LogDir, 0o755); err != nil {
-		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
-			Reason: "logdir_error", Detail: err.Error(),
-		}})
-		return config.ExitUsage
+		return errResult("logdir_error", err), config.ExitUsage, ""
 	}
 	start := timeNow()
 	logFile := filepath.Join(paths.LogDir,
@@ -111,16 +175,12 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 
 	bodyCap, err := os.CreateTemp("", "agy-run-body-*")
 	if err != nil {
-		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
-			Reason: "bodycap_error", Detail: err.Error(),
-		}})
-		return config.ExitUsage
+		return errResult("bodycap_error", err), config.ExitUsage, logFile
 	}
 	bodyPath := bodyCap.Name()
 	defer func() { _ = os.Remove(bodyPath) }()
 
-	args := buildArgs(cfg, logFile)
-
+	args := buildArgs(cfg, model, logFile)
 	tsStart := start.Format(time.RFC3339)
 
 	devnull, _ := os.Open(os.DevNull)
@@ -138,13 +198,13 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	cmd.Stdout = bodyCap
 	cmd.Stderr = opt.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if cfg.Workspace != "" {
+		cmd.Dir = cfg.Workspace // pin agy's cwd so RUN_COMMAND resolves correctly (issue #1)
+	}
 
 	if serr := cmd.Start(); serr != nil {
 		_ = bodyCap.Close()
-		e.Emit(emit.Result{ExitCode: 127, Error: &emit.Error{
-			Reason: "spawn_failed", Detail: serr.Error(),
-		}})
-		return 127
+		return errResult("spawn_failed", serr), 127, logFile
 	}
 
 	// Watchdog: idle + absolute limits. It kills the process group on a limit.
@@ -177,14 +237,17 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 		ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
 		ConversationID:  index.ConvPtr(convID),
 		Continued:       cfg.Continued(),
-		Model:           cfg.Model,
-		CWD:             cwd(),
+		Model:           model,
+		CWD:             effectiveWorkDir(cfg),
 		Prompt:          cfg.Prompt,
 		Artifacts:       []string{},
 	}
 
 	// Assemble the single result object shared by every exit path.
 	r := emit.Result{Body: body}
+	if model != "" {
+		r.Model = model
+	}
 	if convID != "" {
 		r.ConversationID = convID
 	}
@@ -195,10 +258,9 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 		printLogTail(e, logFile)
 		r.Error = killError(reason, cfg)
 		r.ExitCode = rc
-		e.Emit(r)
 		rec.ExitCode = rc
 		index.Append(paths.IndexFile, rec)
-		return rc
+		return r, rc, logFile
 	}
 
 	// body_file: copy the captured body to a stable per-conversation path.
@@ -215,13 +277,22 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 		r.Artifacts = arts
 	}
 
+	// RUN_COMMAND audit: surface agy's failed build/test steps so a caller does
+	// not trust a self-reported "tests are green" (issue #4).
+	if fails := runcmd.Scan(logFile); len(fails) > 0 {
+		r.RunCommandFailures = len(fails)
+		r.Warnings = append(r.Warnings, fmt.Sprintf(
+			"agy の RUN_COMMAND(build/test) が %d 件失敗しています。agy の自己申告（テスト緑等）は要再検証。",
+			len(fails)))
+	}
+
 	// Rate-limit / empty-output detection when agy returned 0 with no body.
 	if rc == config.ExitOK && len(body) == 0 {
 		hits := ratelimit.CountHits(logFile)
 		if hits > 0 {
 			r.Error = &emit.Error{
 				Reason: "rate_limited", LogRatelimitHits: hits,
-				Hint: "agyの5時間枠/レート上限の可能性。残量を確認し、リセットまで委譲不可（Claude側で実装 or 待機）。",
+				Hint: "agyの5時間枠/レート上限の可能性。-m にフォールバック候補を並べるか --wait-quota でリセット待機を検討。",
 			}
 			rc = config.ExitRateLimited
 		} else {
@@ -233,10 +304,54 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	}
 
 	r.ExitCode = rc
-	e.Emit(r)
 	rec.ExitCode = rc
 	index.Append(paths.IndexFile, rec)
-	return rc
+	return r, rc, logFile
+}
+
+// errResult builds a terminal error Result; the caller supplies the exit code.
+func errResult(reason string, err error) emit.Result {
+	return emit.Result{Error: &emit.Error{Reason: reason, Detail: err.Error()}}
+}
+
+// effectiveWorkDir is the directory the run operates from: -W when set,
+// otherwise the caller's cwd.
+func effectiveWorkDir(cfg config.Config) string {
+	if cfg.Workspace != "" {
+		return cfg.Workspace
+	}
+	if d, err := os.Getwd(); err == nil {
+		return d
+	}
+	return ""
+}
+
+// modelLabel renders a model name for human notes ("" -> agy's default).
+func modelLabel(model string) string {
+	if model == "" {
+		return "(default)"
+	}
+	return `"` + model + `"`
+}
+
+// prependWarning puts a non-empty warning at the head of ws (invocation-level
+// preflight warnings should read before per-run ones).
+func prependWarning(ws []string, w string) []string {
+	if w == "" {
+		return ws
+	}
+	return append([]string{w}, ws...)
+}
+
+// nonEmpty drops "" entries (the no-model placeholder) from a model list.
+func nonEmpty(models []string) []string {
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		if m != "" {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // heartbeatPaths returns a provider of the current heartbeat file set. The log
@@ -317,11 +432,12 @@ func readBody(path string) string {
 	return string(data)
 }
 
-// buildArgs assembles the agy argument list (excluding the trailing -p prompt).
-func buildArgs(cfg config.Config, logFile string) []string {
+// buildArgs assembles the agy argument list (excluding the trailing -p prompt)
+// for the given model (the resolved fallback candidate, possibly "").
+func buildArgs(cfg config.Config, model, logFile string) []string {
 	args := []string{"--print-timeout", cfg.PrintTimeout, "--log-file", logFile}
-	if cfg.Model != "" {
-		args = append(args, "--model", cfg.Model)
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	if cfg.Continue {
 		args = append(args, "--continue")
@@ -370,14 +486,6 @@ func copyBody(lastBodyDir, convID, srcPath string) (string, bool) {
 		return "", false
 	}
 	return dst, true
-}
-
-func cwd() string {
-	d, err := os.Getwd()
-	if err != nil {
-		return ""
-	}
-	return d
 }
 
 // killGroup sends SIGKILL to the whole process group (Setpgid gave the child its

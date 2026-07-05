@@ -27,8 +27,19 @@ type Result struct {
 	ConversationID string   `json:"conversation_id,omitempty"`
 	BodyFile       string   `json:"body_file,omitempty"`
 	Artifacts      []string `json:"artifacts,omitempty"`
-	ExitCode       int      `json:"exit_code"`
-	Error          *Error   `json:"error,omitempty"`
+	// Model is the agy model actually used for the emitted attempt (the
+	// resolved fallback when -m carried a comma-separated list). Empty when the
+	// caller passed no -m (agy ran on its own default).
+	Model string `json:"model,omitempty"`
+	// Warnings are non-fatal advisories that do not change exit_code: a
+	// workspace-mismatch preflight hint, or a "self-reported test-green is
+	// unverified" notice when agy's RUN_COMMAND steps failed.
+	Warnings []string `json:"warnings,omitempty"`
+	// RunCommandFailures counts agy RUN_COMMAND (build/test) steps that failed
+	// in this run's log. >0 means agy's "tests are green" claim needs re-checking.
+	RunCommandFailures int    `json:"run_command_failures,omitempty"`
+	ExitCode           int    `json:"exit_code"`
+	Error              *Error `json:"error,omitempty"`
 }
 
 // Error is the structured failure detail embedded in Result.Error (nil on
@@ -40,6 +51,8 @@ type Error struct {
 	Hint             string   `json:"hint,omitempty"`
 	Note             string   `json:"note,omitempty"`
 	AvailableModels  []string `json:"available_models,omitempty"`
+	ModelsTried      []string `json:"models_tried,omitempty"`
+	WaitedSec        int      `json:"waited_sec,omitempty"`
 	LogRatelimitHits int      `json:"log_ratelimit_hits,omitempty"`
 	IdleLimitSec     int      `json:"idle_limit_sec,omitempty"`
 	AbsLimitSec      int      `json:"abs_limit_sec,omitempty"`

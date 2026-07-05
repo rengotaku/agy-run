@@ -22,29 +22,33 @@ const (
 // Defaults for the durations and concurrency knobs.
 const (
 	DefaultPrintTimeout   = "240s"
-	DefaultLockWait       = 240  // seconds
+	DefaultLockWait       = 240   // seconds
 	DefaultMaxConcurrency = 3     // AGY_RUN_MAX_CONCURRENCY
 	DefaultIdleLimitSec   = 600   // AGY_RUN_IDLE_LIMIT  (10 min)
 	DefaultAbsLimitSec    = 3600  // AGY_RUN_ABS_LIMIT   (60 min)
 	DefaultPollSec        = 20    // AGY_RUN_POLL
 	CooldownSec           = 30    // post-kill cooldown
+	DefaultMaxQuotaWait   = 14400 // AGY_RUN_MAX_QUOTA_WAIT (4h cap for --wait-quota)
 )
 
 // Config is the fully-resolved invocation.
 type Config struct {
 	PrintTimeout string   // agy --print-timeout (unit-normalized)
-	Model        string   // -m
+	Model        string   // -m / --model (raw; may be a comma-separated fallback list)
 	Continue     bool     // -c
 	ConvID       string   // -C
 	LockWait     int      // -w (seconds)
 	Dangerous    bool     // -d
 	ExtraArgs    []string // -a (repeatable)
+	Workspace    string   // -W / --workspace (agy cmd.Dir; "" keeps caller cwd)
+	WaitQuota    bool     // --wait-quota (parse "Resets in" and wait once, bounded)
 	Prompt       string   // joined trailing args
 
 	MaxConcurrency int // AGY_RUN_MAX_CONCURRENCY (>=1)
 	IdleLimitSec   int // AGY_RUN_IDLE_LIMIT
 	AbsLimitSec    int // AGY_RUN_ABS_LIMIT
 	PollSec        int // AGY_RUN_POLL
+	MaxQuotaWait   int // AGY_RUN_MAX_QUOTA_WAIT (seconds; --wait-quota upper bound)
 }
 
 // Env abstracts environment lookup for testability.
@@ -61,7 +65,7 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 		LockWait:     DefaultLockWait,
 	}
 
-	opts, rest, err := getopts(argv, "t:m:cC:w:da:h")
+	opts, rest, err := getopts(argv, "t:m:cC:w:W:da:h", longOpts)
 	if err != nil {
 		return cfg, false, err
 	}
@@ -85,6 +89,10 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 			cfg.Dangerous = true
 		case 'a':
 			cfg.ExtraArgs = append(cfg.ExtraArgs, o.arg)
+		case 'W':
+			cfg.Workspace = o.arg
+		case 'Q': // internal short byte for --wait-quota
+			cfg.WaitQuota = true
 		case 'h':
 			return cfg, true, nil
 		}
@@ -106,12 +114,40 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 	if cfg.PollSec < 1 {
 		cfg.PollSec = 1
 	}
+	cfg.MaxQuotaWait = envInt(env, "AGY_RUN_MAX_QUOTA_WAIT", DefaultMaxQuotaWait)
 
 	return cfg, false, nil
 }
 
+// longOpts folds agy-run's long flags onto the internal short bytes Parse
+// dispatches on. --wait-quota has no short form, so it uses the private byte 'Q'.
+var longOpts = map[string]longOpt{
+	"workspace":  {short: 'W', takesArg: true},
+	"model":      {short: 'm', takesArg: true},
+	"wait-quota": {short: 'Q', takesArg: false},
+}
+
 // Continued reports whether this call continues an existing conversation.
 func (c Config) Continued() bool { return c.Continue || c.ConvID != "" }
+
+// Models splits -m on commas into an ordered fallback list (each trimmed,
+// empties dropped). With no -m it returns a single empty element so callers can
+// run agy on its default model with one uniform loop iteration.
+func (c Config) Models() []string {
+	if strings.TrimSpace(c.Model) == "" {
+		return []string{""}
+	}
+	var out []string
+	for _, m := range strings.Split(c.Model, ",") {
+		if s := strings.TrimSpace(m); s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return []string{""}
+	}
+	return out
+}
 
 // normalizeDuration appends "s" to a bare integer duration ("240" -> "240s").
 func normalizeDuration(d string) string {

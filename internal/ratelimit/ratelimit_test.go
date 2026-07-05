@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCountHits(t *testing.T) {
@@ -47,5 +48,37 @@ func TestCountHitsFromFile(t *testing.T) {
 	}
 	if got := CountHits(p); got != 1 {
 		t.Errorf("CountHits = %d, want 1", got)
+	}
+}
+
+func TestResetWaitParses(t *testing.T) {
+	cases := map[string]time.Duration{
+		"RESOURCE_EXHAUSTED. Resets in 3h0m10s.": 3*time.Hour + 10*time.Second,
+		"quota reached. Resets in 45m 30s":       45*time.Minute + 30*time.Second,
+		"Resets in 90s":                          90 * time.Second,
+		"resets in 2h":                           2 * time.Hour,
+	}
+	for line, want := range cases {
+		got, ok := resetWait(strings.NewReader(line))
+		if !ok || got != want {
+			t.Errorf("resetWait(%q) = %v ok=%v, want %v", line, got, ok, want)
+		}
+	}
+}
+
+func TestResetWaitPrefersLast(t *testing.T) {
+	log := "Resets in 3h0m0s\nretry\nResets in 0h0m5s\n"
+	got, ok := resetWait(strings.NewReader(log))
+	if !ok || got != 5*time.Second {
+		t.Errorf("resetWait = %v ok=%v, want 5s (last hint wins)", got, ok)
+	}
+}
+
+func TestResetWaitNoHint(t *testing.T) {
+	if _, ok := resetWait(strings.NewReader("429 rate-limit but no reset info\n")); ok {
+		t.Error("no reset hint should yield ok=false")
+	}
+	if _, ok := ResetWait(filepath.Join(t.TempDir(), "nope.log")); ok {
+		t.Error("missing file should yield ok=false")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rengotaku/agy-run/internal/config"
 	"github.com/rengotaku/agy-run/internal/emit"
@@ -25,24 +26,46 @@ func parseResult(t *testing.T, out string) emit.Result {
 const stubConv = "11111111-1111-1111-1111-111111111111"
 
 // stubAgy is a POSIX-sh stand-in for the real agy binary. It writes a
-// conversation line (and optional extra lines) to --log-file, echoes STUB_BODY
-// to stdout, and exits STUB_EXIT. Behaviour is driven entirely by env vars so a
-// single stub covers every path.
+// conversation line (plus the cwd and optional extra lines) to --log-file,
+// echoes STUB_BODY to stdout, and exits STUB_EXIT. Behaviour is driven entirely
+// by env vars so a single stub covers every path:
+//
+//	STUB_RL_MODEL  rate-limit (empty body + 429) when --model equals this
+//	STUB_RL_UNTIL  rate-limit the first N calls (needs STUB_COUNT_FILE)
+//	STUB_COUNT_FILE file used to count invocations across retries
+//	STUB_RESET     the "Resets in <dur>" value written on a rate-limit
 const stubAgy = `#!/bin/sh
 if [ "$1" = "models" ]; then
   printf '%s\n' "Gemini 3.5 Flash (High)" "Gemini 3.1 Pro (High)"
   exit 0
 fi
 logfile=""
+model=""
 prev=""
 for a in "$@"; do
-  if [ "$prev" = "--log-file" ]; then logfile="$a"; fi
+  case "$prev" in
+    --log-file) logfile="$a" ;;
+    --model) model="$a" ;;
+  esac
   prev="$a"
 done
+n=0
+if [ -n "$STUB_COUNT_FILE" ]; then
+  n=$(cat "$STUB_COUNT_FILE" 2>/dev/null || echo 0)
+  echo $((n + 1)) > "$STUB_COUNT_FILE"
+fi
+rl=0
+if [ -n "$STUB_RL_MODEL" ] && [ "$model" = "$STUB_RL_MODEL" ]; then rl=1; fi
+if [ -n "$STUB_RL_UNTIL" ] && [ "$n" -lt "$STUB_RL_UNTIL" ]; then rl=1; fi
 if [ -n "$logfile" ]; then
   printf 'conversation=%s\n' "${STUB_CONV}" > "$logfile"
+  printf 'cwd=%s\n' "$(pwd)" >> "$logfile"
   if [ -n "$STUB_LOG_EXTRA" ]; then printf '%s\n' "$STUB_LOG_EXTRA" >> "$logfile"; fi
+  if [ "$rl" = "1" ]; then
+    printf 'HTTP 429 resource_exhausted. Resets in %s\n' "${STUB_RESET:-0h0m1s}" >> "$logfile"
+  fi
 fi
+if [ "$rl" = "1" ]; then exit 0; fi
 if [ -n "$STUB_BODY" ]; then printf '%s\n' "$STUB_BODY"; fi
 if [ -n "$STUB_SLEEP" ]; then sleep "$STUB_SLEEP"; fi
 exit ${STUB_EXIT:-0}
@@ -224,6 +247,177 @@ func TestRunStallExit44(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "antigravity-cli", ".agy-run.last-kill")); err != nil {
 		t.Errorf("kill stamp not created: %v", err)
+	}
+}
+
+// latestLog returns the newest agy-run log file under the state dir.
+func latestLog(t *testing.T, home string) string {
+	t.Helper()
+	logs, err := filepath.Glob(filepath.Join(home, ".gemini", "antigravity-cli", "log", "agy-run-*.log"))
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("no log file found: %v", err)
+	}
+	newest, newestMod := "", time.Time{}
+	for _, l := range logs {
+		if info, e := os.Stat(l); e == nil && info.ModTime().After(newestMod) {
+			newest, newestMod = l, info.ModTime()
+		}
+	}
+	return newest
+}
+
+// TestRunWorkspaceSetsCmdDir (issue #1): -W pins agy's cwd so RUN_COMMAND
+// resolves in the right tree. The stub records its $PWD into the log.
+func TestRunWorkspaceSetsCmdDir(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "done")
+	workDir := t.TempDir()
+
+	rc, _, _ := run(t, home, []string{"-W", workDir, "build it"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	log, _ := os.ReadFile(latestLog(t, home))
+	realWork, _ := filepath.EvalSymlinks(workDir)
+	if !strings.Contains(string(log), "cwd="+workDir) && !strings.Contains(string(log), "cwd="+realWork) {
+		t.Errorf("agy cwd not set to -W dir; log:\n%s", log)
+	}
+}
+
+// TestRunModelFallback (issue #3): -m "A,B" with A rate-limited must retry on B
+// and report the model actually used.
+func TestRunModelFallback(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "ok from fallback")
+	t.Setenv("STUB_RL_MODEL", "Gemini 3.5 Flash (High)") // A rate-limits
+
+	rc, out, errb := run(t, home,
+		[]string{"-m", "Gemini 3.5 Flash (High),Gemini 3.1 Pro (High)", "do it"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0 (fallback should succeed)\nstderr: %s", rc, errb)
+	}
+	r := parseResult(t, out)
+	if r.Model != "Gemini 3.1 Pro (High)" {
+		t.Errorf("used model = %q, want the fallback candidate", r.Model)
+	}
+	if r.Error != nil {
+		t.Errorf("fallback success should have no error: %+v", r.Error)
+	}
+	if !strings.Contains(errb, "次候補") {
+		t.Errorf("expected fallback note on stderr, got %q", errb)
+	}
+}
+
+// TestRunModelFallbackExhausted (issue #3): every candidate rate-limited keeps
+// the exit-42 contract and lists what was tried.
+func TestRunModelFallbackExhausted(t *testing.T) {
+	home := newHome(t)
+	// Rate-limit every attempt (both candidates) via the invocation counter.
+	t.Setenv("STUB_RL_UNTIL", "9")
+	t.Setenv("STUB_COUNT_FILE", filepath.Join(t.TempDir(), "n"))
+
+	rc, out, _ := run(t, home,
+		[]string{"-m", "Gemini 3.5 Flash (High),Gemini 3.1 Pro (High)", "do it"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want 42", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Fatalf("want rate_limited, got %+v", r.Error)
+	}
+	if len(r.Error.ModelsTried) != 2 {
+		t.Errorf("models_tried = %v, want both candidates", r.Error.ModelsTried)
+	}
+}
+
+// TestRunWaitQuota (issue #3): --wait-quota parses "Resets in" and retries once
+// after (a stubbed) wait; the second call succeeds.
+func TestRunWaitQuota(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "ok after wait")
+	t.Setenv("STUB_RL_UNTIL", "1") // only the first call rate-limits
+	t.Setenv("STUB_RESET", "0h0m2s")
+	t.Setenv("STUB_COUNT_FILE", filepath.Join(t.TempDir(), "n"))
+
+	var slept time.Duration
+	orig := sleepFor
+	sleepFor = func(d time.Duration) { slept = d }
+	defer func() { sleepFor = orig }()
+
+	rc, out, errb := run(t, home, []string{"--wait-quota", "do it"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0 (retry after wait)\nstderr: %s", rc, errb)
+	}
+	if slept != 2*time.Second {
+		t.Errorf("slept = %v, want 2s (parsed from Resets in)", slept)
+	}
+	r := parseResult(t, out)
+	if !strings.Contains(r.Body, "ok after wait") {
+		t.Errorf("body = %q", r.Body)
+	}
+}
+
+// TestRunRunCommandFailureWarns (issue #4): a failed RUN_COMMAND step in the log
+// surfaces as a warning and a non-zero run_command_failures, even when agy's
+// body claims success and exits 0.
+func TestRunRunCommandFailureWarns(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "最後に go test を実行しビルドとテストが共に緑です")
+	t.Setenv("STUB_LOG_EXTRA",
+		"error executing cascade step: CORTEX_STEP_TYPE_RUN_COMMAND: /home/x/repo: no such directory")
+
+	rc, out, errb := run(t, home, []string{"implement"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0 (agy self-reported success)", rc)
+	}
+	r := parseResult(t, out)
+	if r.RunCommandFailures != 1 {
+		t.Errorf("run_command_failures = %d, want 1", r.RunCommandFailures)
+	}
+	if len(r.Warnings) == 0 || !strings.Contains(strings.Join(r.Warnings, "\n"), "RUN_COMMAND") {
+		t.Errorf("expected RUN_COMMAND warning, got %v", r.Warnings)
+	}
+	if !strings.Contains(errb, "warning:") {
+		t.Errorf("warning should also reach stderr, got %q", errb)
+	}
+}
+
+// TestRunWorkspacePreflightWarns (issue #2): running against a feature worktree
+// whose sibling main/ is the trusted workspace warns that agy writes to main.
+func TestRunWorkspacePreflightWarns(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "edited")
+
+	container := t.TempDir()
+	mainWT := filepath.Join(container, "main")
+	featWT := filepath.Join(container, "feat")
+	for _, d := range []string{mainWT, featWT} {
+		if err := os.MkdirAll(filepath.Join(d, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// agy trusts only main/.
+	settings := filepath.Join(home, ".gemini", "antigravity-cli", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"trustedWorkspaces":["` + mainWT + `"]}`
+	if err := os.WriteFile(settings, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Caller works in the feature worktree via -W.
+	rc, out, errb := run(t, home, []string{"-W", featWT, "edit files"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	joined := strings.Join(r.Warnings, "\n")
+	if !strings.Contains(joined, "trusted workspace") {
+		t.Errorf("expected workspace-mismatch warning, got %v", r.Warnings)
+	}
+	if !strings.Contains(errb, "warning:") {
+		t.Errorf("preflight warning should reach stderr, got %q", errb)
 	}
 }
 
