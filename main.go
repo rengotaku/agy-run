@@ -39,6 +39,20 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     AGY_RUN_ABS_LIMIT        絶対上限秒（既定 3600 = 60分。超過で exit 124）
     AGY_RUN_POLL             watchdog ポーリング秒（既定 20）
 
+出力:
+    1回の実行 = stdout に JSON 1個。stderr は cooldown 通知や
+    stall/timeout のログ末尾など人向けテキストのみ。
+    {
+      "body":            "agy の回答本文",
+      "conversation_id": "継続用 ID（agy-run -C <id>）",
+      "body_file":       "本文の決定論的コピー先パス",
+      "artifacts":       ["生成画像の絶対パス", ...],
+      "exit_code":       0,
+      "error":           null   // 失敗時のみ {"reason": ...}
+    }
+    例: agy-run "質問" 2>/dev/null | jq -r .body        # 本文だけ
+        agy-run "質問" 2>/dev/null | jq -r .conversation_id
+
 exit code: 0=成功 / 2=引数エラー / 4=ロック待ちタイムアウト /
            42=rate_limited / 44=アイドルストール / 124=絶対上限 / その他=agy 自身
 `
