@@ -25,7 +25,6 @@ import (
 type Result struct {
 	Body           string   `json:"body"`
 	ConversationID string   `json:"conversation_id,omitempty"`
-	ContinueCmd    string   `json:"continue_cmd,omitempty"`
 	BodyFile       string   `json:"body_file,omitempty"`
 	Artifacts      []string `json:"artifacts,omitempty"`
 	ExitCode       int      `json:"exit_code"`

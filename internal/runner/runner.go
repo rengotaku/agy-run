@@ -170,7 +170,6 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	r := emit.Result{Body: body}
 	if convID != "" {
 		r.ConversationID = convID
-		r.ContinueCmd = fmt.Sprintf("agy-run -C %s ...", convID)
 	}
 
 	// Stall / absolute-timeout branches: log tail to stderr, error in the result.
