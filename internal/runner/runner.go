@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +44,22 @@ func Run(cfg config.Config, opt Options) int {
 	// Ensure the state dir exists so the slot lock files can be created even on
 	// a fresh machine (agy normally creates it, but do not depend on that).
 	_ = os.MkdirAll(paths.StateDir, 0o755)
+
+	// Guard 0: validate -m against the authoritative `agy models` list so a
+	// wrong model name fails fast (with the valid options in the result) instead
+	// of silently running on agy's fallback model. Best-effort: if the list
+	// cannot be obtained we skip validation and pass the name through.
+	if cfg.Model != "" {
+		if models, ok := listModels(paths.AgyBin); ok && !contains(models, cfg.Model) {
+			e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+				Reason:          "unknown_model",
+				Detail:          cfg.Model,
+				AvailableModels: models,
+				Hint:            `-m は agy models の名称と完全一致が必要（例: "Gemini 3.5 Flash (High)"）。`,
+			}})
+			return config.ExitUsage
+		}
+	}
 
 	// Guard 1: cooldown after a prior kill (avoids the exit-144 instant death).
 	cooldown(e, paths.KillStamp)
@@ -262,6 +279,33 @@ func printLogTail(e *emit.Emitter, logFile string) {
 	if tail := tailLines(logFile, 5); tail != "" {
 		e.Plain(tail)
 	}
+}
+
+// listModels returns the model names from `agy models` (one per line). ok is
+// false on any error so the caller can skip validation rather than block.
+func listModels(agyBin string) (models []string, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := commandContext(ctx, agyBin, []string{"models"}).Output()
+	if err != nil {
+		return nil, false
+	}
+	for _, ln := range strings.Split(string(out), "\n") {
+		if s := strings.TrimSpace(ln); s != "" {
+			models = append(models, s)
+		}
+	}
+	return models, len(models) > 0
+}
+
+// contains reports whether s is exactly one of items.
+func contains(items []string, s string) bool {
+	for _, it := range items {
+		if it == s {
+			return true
+		}
+	}
+	return false
 }
 
 // readBody returns the captured agy body, or "" if it cannot be read.

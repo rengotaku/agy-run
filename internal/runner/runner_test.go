@@ -29,6 +29,10 @@ const stubConv = "11111111-1111-1111-1111-111111111111"
 // to stdout, and exits STUB_EXIT. Behaviour is driven entirely by env vars so a
 // single stub covers every path.
 const stubAgy = `#!/bin/sh
+if [ "$1" = "models" ]; then
+  printf '%s\n' "Gemini 3.5 Flash (High)" "Gemini 3.1 Pro (High)"
+  exit 0
+fi
 logfile=""
 prev=""
 for a in "$@"; do
@@ -118,6 +122,47 @@ func TestRunSuccessContract(t *testing.T) {
 	}
 	if info, _ := os.Stat(idx); info != nil && info.Mode().Perm() != 0o600 {
 		t.Errorf("index perm = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestRunUnknownModel(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "should not run")
+
+	rc, out, _ := run(t, home, []string{"-m", "Gemnini 3.5 Flash (Hihg)", "hi"})
+	if rc != config.ExitUsage {
+		t.Fatalf("rc = %d, want 2 (usage)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "unknown_model" {
+		t.Fatalf("expected unknown_model error, got %+v", r)
+	}
+	// The valid list is returned so the caller can retry correctly.
+	found := false
+	for _, m := range r.Error.AvailableModels {
+		if m == "Gemini 3.5 Flash (High)" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("available_models missing valid name: %v", r.Error.AvailableModels)
+	}
+}
+
+func TestRunValidModelPasses(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "ok")
+
+	rc, out, _ := run(t, home, []string{"-m", "Gemini 3.5 Flash (High)", "hi"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil {
+		t.Errorf("valid model should not error: %+v", r.Error)
+	}
+	if !strings.Contains(r.Body, "ok") {
+		t.Errorf("body = %q", r.Body)
 	}
 }
 

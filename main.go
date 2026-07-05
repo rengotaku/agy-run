@@ -26,7 +26,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
   agy-run [-t <dur>] [-m <model>] [-c | -C <conversation-id>] [-w <lock-wait-sec>]
           [-d] [-a <extra-arg>]... <prompt>
     -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）
-    -m  モデル名（例: "Gemini 3.5 Flash (High)"）
+    -m  モデル名（例: "Gemini 3.5 Flash (High)"。agy models と完全一致必須。
+        不一致は実行前に exit 2 で弾き、error.available_models に候補を返す）
     -c  直近会話の継続
     -C  会話IDを指定して継続
     -w  ロック待ち秒数（既定 240）

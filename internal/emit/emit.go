@@ -35,16 +35,17 @@ type Result struct {
 // success). Reason is always set; the remaining fields are populated per
 // failure kind and omitted when zero.
 type Error struct {
-	Reason           string `json:"reason"`
-	Detail           string `json:"detail,omitempty"`
-	Hint             string `json:"hint,omitempty"`
-	Note             string `json:"note,omitempty"`
-	LogRatelimitHits int    `json:"log_ratelimit_hits,omitempty"`
-	IdleLimitSec     int    `json:"idle_limit_sec,omitempty"`
-	AbsLimitSec      int    `json:"abs_limit_sec,omitempty"`
-	PrintTimeout     string `json:"print_timeout,omitempty"`
-	WaitSec          int    `json:"wait_sec,omitempty"`
-	MaxConcurrency   int    `json:"max_concurrency,omitempty"`
+	Reason           string   `json:"reason"`
+	Detail           string   `json:"detail,omitempty"`
+	Hint             string   `json:"hint,omitempty"`
+	Note             string   `json:"note,omitempty"`
+	AvailableModels  []string `json:"available_models,omitempty"`
+	LogRatelimitHits int      `json:"log_ratelimit_hits,omitempty"`
+	IdleLimitSec     int      `json:"idle_limit_sec,omitempty"`
+	AbsLimitSec      int      `json:"abs_limit_sec,omitempty"`
+	PrintTimeout     string   `json:"print_timeout,omitempty"`
+	WaitSec          int      `json:"wait_sec,omitempty"`
+	MaxConcurrency   int      `json:"max_concurrency,omitempty"`
 }
 
 // Emitter writes the Result to out (stdout) and human diagnostics to err (stderr).
