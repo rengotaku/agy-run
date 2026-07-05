@@ -16,6 +16,7 @@ type Paths struct {
 	IndexFile   string // index.jsonl
 	KillStamp   string // .agy-run.last-kill
 	SlotDir     string // dir holding .agy-run.slot.N lock files
+	Settings    string // <state>/settings.json (trustedWorkspaces for preflight)
 }
 
 // DefaultPaths builds the standard layout under home, honoring XDG_DATA_HOME
@@ -35,6 +36,7 @@ func DefaultPaths(home string, getenv func(string) string) Paths {
 		IndexFile:   filepath.Join(dataHome, "agy-run", "index.jsonl"),
 		KillStamp:   filepath.Join(state, ".agy-run.last-kill"),
 		SlotDir:     state,
+		Settings:    filepath.Join(state, "settings.json"),
 	}
 }
 
