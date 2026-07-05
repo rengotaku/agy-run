@@ -22,17 +22,42 @@ import (
 
 const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go 版)。
 
+生の "agy -p" はハング（承認待ち・print-timeout 無視・kill 直後の exit 144）や
+出力の不安定さがある。agy-run はプロセス監視と 1実行=stdout に JSON 1個 の出力契約で
+これを潰す。利用の詳細（フラグ・自動制御・出力・exit code）はこのヘルプが正典。
+
 使い方:
   agy-run [-t <dur>] [-m <model>] [-c | -C <conversation-id>] [-w <lock-wait-sec>]
           [-d] [-a <extra-arg>]... <prompt>
-    -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）
-    -m  モデル名（例: "Gemini 3.5 Flash (High)"。agy models と完全一致必須。
-        不一致は実行前に exit 2 で弾き、error.available_models に候補を返す）
+
+フラグ:
+    -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）。
+        ※ agy 自身へ渡すだけ。外側の総枠は下記 idle/abs watchdog が別に効く
+    -m  モデル名。"agy models" の文字列と完全一致必須（バージョン・大文字小文字・括弧まで）。
+        記憶で書かず迷ったら "agy models" を実行して正確な名前を取る。
+        不一致は実行前に exit 2 で弾き、error.available_models[] に候補を返す
+        （サイレントに別モデルで走ることはない）。未指定なら agy 既定モデル。
+        例: "Gemini 3.5 Flash (High)" / "Gemini 3.1 Pro (High)"
     -c  直近会話の継続
-    -C  会話IDを指定して継続
-    -w  ロック待ち秒数（既定 240）
+    -C  会話ID (<conversation-id>) を指定して継続（前回結果 JSON の conversation_id）
+    -w  スロットロック待ち秒数（既定 240）。空きスロットを取れなければ exit 4
     -d  --dangerously-skip-permissions を付与（読み取り/調査主体のタスク限定）
     -a  agy へそのまま渡す追加引数（繰り返し可。例: -a --add-dir -a /path/to/repo）
+    -h  このヘルプを表示
+
+ラッパーが自動でやること:
+    - アイドル watchdog（本質的な防御）: heartbeat（log / body / transcript.jsonl の
+      最新 mtime）が AGY_RUN_IDLE_LIMIT 途絶えたら stall と判定し、プロセスグループごと
+      kill → exit 44。総経過が AGY_RUN_ABS_LIMIT を超えたら kill → exit 124。
+      agy 自身の --print-timeout は無視されることがある（実証: 90s 指定で6分+ 0出力）ため
+      この外側監視が要。ポーリングは AGY_RUN_POLL 秒ごと。
+    - クールダウン: kill 後 30 秒は次回実行を自動待機（kill 直後再実行の exit 144 即死を防止）
+    - 有界並列: agy-run 同士を N スロット（AGY_RUN_MAX_CONCURRENCY・既定 3）で並列化。
+      超過分は空きスロット待ち → 取れなければ exit 4
+    - 会話継続: 結果 JSON に conversation_id を出す → -C <id> で文脈を保った追撃ができる
+    - 生成画像の検出: agy は本文にパスを出さない（「生成しました」等のテキストのみ）ため、
+      今回の実行で新規作成された画像を検出し artifacts[]（絶対パス配列）で返す
+    - 単一 JSON 出力: 実行結果を stdout に 1 個の JSON にまとめる（encoding/json で常にエスケープ）
 
 環境変数:
     AGY_RUN_MAX_CONCURRENCY  有界並列スロット数（既定 3）
@@ -40,22 +65,25 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     AGY_RUN_ABS_LIMIT        絶対上限秒（既定 3600 = 60分。超過で exit 124）
     AGY_RUN_POLL             watchdog ポーリング秒（既定 20）
 
-出力:
-    1回の実行 = stdout に JSON 1個。stderr は cooldown 通知や
-    stall/timeout のログ末尾など人向けテキストのみ。
+出力（stdout = JSON 1個。stderr は cooldown 通知や stall/timeout のログ末尾など人向けのみ）:
     {
       "body":            "agy の回答本文",
       "conversation_id": "継続用 ID（agy-run -C <id>）",
-      "body_file":       "本文の決定論的コピー先パス",
+      "body_file":       "本文の決定論的コピー先パス（純本文を読むならこのファイル）",
       "artifacts":       ["生成画像の絶対パス", ...],
       "exit_code":       0,
-      "error":           null   // 失敗時のみ {"reason": ...}
+      "error":           null   // 失敗時のみ {"reason": ..., "detail": ...}
     }
-    例: agy-run "質問" 2>/dev/null | jq -r .body        # 本文だけ
-        agy-run "質問" 2>/dev/null | jq -r .conversation_id
+    例: agy-run "質問" 2>/dev/null | jq -r .body             # 本文だけ取り出す
+        agy-run "質問" 2>/dev/null | jq -r .conversation_id  # 継続用 ID を取る
+        agy-run -C <id> "続きの質問"                          # 同じ会話に追撃
+        agy-run -m "Gemini 3.5 Flash (High)" -t 120s "軽い質問"
+        agy-run "質問" 2>/dev/null | jq -r '.artifacts[]'    # 生成画像のパス列挙
 
-exit code: 0=成功 / 2=引数エラー / 4=ロック待ちタイムアウト /
-           42=rate_limited / 44=アイドルストール / 124=絶対上限 / その他=agy 自身
+exit code:
+    0=成功 / 2=引数エラー / 4=スロットロック待ちタイムアウト /
+    42=レート制限（本文ゼロ＋ログに 429）/ 44=アイドルストール（heartbeat 途絶）/
+    124=絶対上限タイムアウト / その他=agy 自身の exit code
 `
 
 func main() {
