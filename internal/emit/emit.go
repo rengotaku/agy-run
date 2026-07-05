@@ -1,18 +1,17 @@
-// Package emit writes the agy-run metadata contract: single-key
-// {"agy_run":...} JSON Lines, all on the diagnostic (stderr) stream.
+// Package emit builds the agy-run output contract: exactly one JSON Result
+// object on stdout describing the whole outcome of an invocation (body plus all
+// metadata a caller needs), and free-text human diagnostics on stderr.
 //
-// Stream contract (Unix / clig.dev convention — consumed mechanically by
-// callers: Claude / improve-loop / skills):
-//   - stdout carries the agy body only — raw text, no markers, no JSON. The
-//     body flows straight from agy's stdout, so `agy-run ... 2>/dev/null`
-//     yields the body alone and EOF is the terminator (no begin/end markers).
-//   - stderr carries every wrapper line: diagnostics and structured meta. Each
-//     meta line is one JSON object whose sole top-level key is "agy_run"
-//     (note/cooldown/error/timeout/stall/conversation/body_file/artifacts).
+// Contract (consumed mechanically by callers — Claude / improve-loop / skills):
+//   - stdout: one indented JSON object. Read the answer with `jq -r .body`, the
+//     continuation id with `.conversation_id`, image paths with `.artifacts[]`,
+//     and branch on `.exit_code` / `.error`.
+//   - stderr: optional human advisories (cooldown notice, stall/timeout log
+//     tail). Never required for machine consumption.
 //
-// All meta lines are produced with encoding/json so values are always correctly
-// escaped, and — since they never touch stdout — can never collide with body
-// text that happens to contain a `{"agy_run":...}`-shaped line.
+// One object per run replaces the old scheme of several {"agy_run":...} JSON
+// lines interleaved with raw body — no stream-ordering races, no begin/end
+// markers, no body/meta collision.
 package emit
 
 import (
@@ -21,42 +20,63 @@ import (
 	"io"
 )
 
-// Emitter serializes metadata contract lines to the diagnostic (stderr) stream.
-// The agy body itself is written directly to stdout by the runner (via an
-// io.MultiWriter), never through the Emitter — keeping stdout body-only.
+// Result is the single JSON object agy-run writes to stdout: the complete
+// outcome of one invocation. Zero-valued optional fields are omitted.
+type Result struct {
+	Body           string   `json:"body"`
+	ConversationID string   `json:"conversation_id,omitempty"`
+	ContinueCmd    string   `json:"continue_cmd,omitempty"`
+	BodyFile       string   `json:"body_file,omitempty"`
+	Artifacts      []string `json:"artifacts,omitempty"`
+	ExitCode       int      `json:"exit_code"`
+	Error          *Error   `json:"error,omitempty"`
+}
+
+// Error is the structured failure detail embedded in Result.Error (nil on
+// success). Reason is always set; the remaining fields are populated per
+// failure kind and omitted when zero.
+type Error struct {
+	Reason           string `json:"reason"`
+	Detail           string `json:"detail,omitempty"`
+	Hint             string `json:"hint,omitempty"`
+	Note             string `json:"note,omitempty"`
+	LogRatelimitHits int    `json:"log_ratelimit_hits,omitempty"`
+	IdleLimitSec     int    `json:"idle_limit_sec,omitempty"`
+	AbsLimitSec      int    `json:"abs_limit_sec,omitempty"`
+	PrintTimeout     string `json:"print_timeout,omitempty"`
+	WaitSec          int    `json:"wait_sec,omitempty"`
+	MaxConcurrency   int    `json:"max_concurrency,omitempty"`
+}
+
+// Emitter writes the Result to out (stdout) and human diagnostics to err (stderr).
 type Emitter struct {
-	Err io.Writer // diagnostic/meta lines (all agy_run JSON + free-text log tails)
+	Out io.Writer
+	Err io.Writer
 }
 
-// New returns an Emitter writing to err (stderr).
-func New(err io.Writer) *Emitter {
-	return &Emitter{Err: err}
+// New returns an Emitter writing to out (stdout) and err (stderr).
+func New(out, err io.Writer) *Emitter {
+	return &Emitter{Out: out, Err: err}
 }
 
-// line marshals fields into a single {"agy_run":<event>,...} JSON object and
-// writes it (newline-terminated) to w. Marshalling never fails for the map
-// shapes we build, but any error is surfaced to the caller for safety.
-func line(w io.Writer, event string, fields map[string]any) error {
-	obj := make(map[string]any, len(fields)+1)
-	for k, v := range fields {
-		obj[k] = v
-	}
-	obj["agy_run"] = event
-	b, err := json.Marshal(obj)
+// Emit writes r as a single indented JSON object (newline-terminated) to stdout.
+// Marshalling never fails for these shapes, but on the impossible error we still
+// emit a well-formed object rather than a partial write.
+func (e *Emitter) Emit(r Result) {
+	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
-		return err
+		b = []byte(fmt.Sprintf(`{"body":"","exit_code":%d,"error":{"reason":"marshal_failed"}}`, r.ExitCode))
 	}
-	_, err = fmt.Fprintf(w, "%s\n", b)
-	return err
+	_, _ = fmt.Fprintf(e.Out, "%s\n", b)
 }
 
-// Meta writes a contract line to the diagnostic (stderr) stream.
-func (e *Emitter) Meta(event string, fields map[string]any) {
-	_ = line(e.Err, event, fields)
+// Note writes a free-text human advisory line (newline-terminated) to stderr.
+func (e *Emitter) Note(s string) {
+	_, _ = fmt.Fprintln(e.Err, s)
 }
 
-// Plain writes free text (non-JSON) to the diagnostic stream. Used only for the
-// timeout/stall log tail, which is intentionally not JSON-wrapped.
+// Plain writes free text (verbatim, no added newline) to stderr — used for the
+// stall/timeout log tail.
 func (e *Emitter) Plain(s string) {
 	_, _ = fmt.Fprint(e.Err, s)
 }

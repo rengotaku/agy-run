@@ -1,8 +1,8 @@
 // Package runner orchestrates a single agy-run invocation: concurrency slot,
 // post-kill cooldown, process launch with an idle/absolute watchdog, and the
-// output contract — the agy body flows raw to stdout while all wrapper meta
-// (conversation/body_file/artifacts and the rate-limit / empty-output / stall /
-// timeout diagnostics) goes to stderr as {"agy_run":...} JSON.
+// output contract — exactly one JSON emit.Result on stdout (body plus
+// conversation/body_file/artifacts/exit_code/error), with human diagnostics
+// (cooldown notice, stall/timeout log tail) on stderr.
 package runner
 
 import (
@@ -37,7 +37,7 @@ type Options struct {
 
 // Run executes one invocation and returns the process exit code.
 func Run(cfg config.Config, opt Options) int {
-	e := emit.New(opt.Stderr)
+	e := emit.New(opt.Stdout, opt.Stderr)
 	paths := DefaultPaths(opt.Home, opt.Getenv)
 
 	// Ensure the state dir exists so the slot lock files can be created even on
@@ -50,13 +50,15 @@ func Run(cfg config.Config, opt Options) int {
 	// Guard 2: bounded-parallel concurrency slot.
 	h, ok, err := slot.Acquire(paths.SlotDir, cfg.MaxConcurrency, cfg.LockWait)
 	if err != nil {
-		e.Meta("error", map[string]any{"reason": "slot_error", "detail": err.Error()})
+		e.Emit(emit.Result{ExitCode: config.ExitLockTimeout, Error: &emit.Error{
+			Reason: "slot_error", Detail: err.Error(),
+		}})
 		return config.ExitLockTimeout
 	}
 	if !ok {
-		e.Meta("error", map[string]any{
-			"reason": "lock_timeout", "wait_sec": cfg.LockWait, "max_concurrency": cfg.MaxConcurrency,
-		})
+		e.Emit(emit.Result{ExitCode: config.ExitLockTimeout, Error: &emit.Error{
+			Reason: "lock_timeout", WaitSec: cfg.LockWait, MaxConcurrency: cfg.MaxConcurrency,
+		}})
 		return config.ExitLockTimeout
 	}
 	defer h.Release()
@@ -65,7 +67,7 @@ func Run(cfg config.Config, opt Options) int {
 }
 
 // cooldown sleeps out the remainder of the post-kill cooldown window if a kill
-// stamp exists and is recent.
+// stamp exists and is recent, printing a human advisory to stderr.
 func cooldown(e *emit.Emitter, killStamp string) {
 	info, err := os.Stat(killStamp)
 	if err != nil {
@@ -73,15 +75,17 @@ func cooldown(e *emit.Emitter, killStamp string) {
 	}
 	remain := config.CooldownSec - int(timeNow().Sub(info.ModTime()).Seconds())
 	if remain > 0 {
-		e.Meta("cooldown", map[string]any{"wait_remaining_sec": remain})
+		e.Note(fmt.Sprintf("cooldown: 前回 kill 直後のため %ds 待機します", remain))
 		time.Sleep(time.Duration(remain) * time.Second)
 	}
 }
 
-// execute runs agy under the watchdog and emits the full contract.
+// execute runs agy under the watchdog and emits the single-object result.
 func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	if err := os.MkdirAll(paths.LogDir, 0o755); err != nil {
-		e.Meta("error", map[string]any{"reason": "logdir_error", "detail": err.Error()})
+		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+			Reason: "logdir_error", Detail: err.Error(),
+		}})
 		return config.ExitUsage
 	}
 	start := timeNow()
@@ -90,7 +94,9 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 
 	bodyCap, err := os.CreateTemp("", "agy-run-body-*")
 	if err != nil {
-		e.Meta("error", map[string]any{"reason": "bodycap_error", "detail": err.Error()})
+		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+			Reason: "bodycap_error", Detail: err.Error(),
+		}})
 		return config.ExitUsage
 	}
 	bodyPath := bodyCap.Name()
@@ -108,15 +114,19 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// agy's stdout is captured (not forwarded live): the raw body is folded into
+	// the final JSON result, so nothing but that one object reaches our stdout.
 	cmd := commandContext(ctx, paths.AgyBin, append(args, "-p", cfg.Prompt))
 	cmd.Stdin = devnull
-	cmd.Stdout = io.MultiWriter(opt.Stdout, bodyCap)
+	cmd.Stdout = bodyCap
 	cmd.Stderr = opt.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if serr := cmd.Start(); serr != nil {
 		_ = bodyCap.Close()
-		e.Meta("error", map[string]any{"reason": "spawn_failed", "detail": serr.Error(), "exit_code": 127})
+		e.Emit(emit.Result{ExitCode: 127, Error: &emit.Error{
+			Reason: "spawn_failed", Detail: serr.Error(),
+		}})
 		return 127
 	}
 
@@ -140,6 +150,7 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	rc := exitCode(cmd, waitErr, reason)
 
 	convID := convlog.ResolveConvID(logFile)
+	body := readBody(bodyPath)
 
 	rec := index.Record{
 		TSStart:         tsStart,
@@ -155,28 +166,29 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 		Artifacts:       []string{},
 	}
 
-	// Stall / absolute-timeout branches: kill diagnostics, then index + exit.
+	// Assemble the single result object shared by every exit path.
+	r := emit.Result{Body: body}
+	if convID != "" {
+		r.ConversationID = convID
+		r.ContinueCmd = fmt.Sprintf("agy-run -C %s ...", convID)
+	}
+
+	// Stall / absolute-timeout branches: log tail to stderr, error in the result.
 	if reason == watchdog.Stall || reason == watchdog.AbsTimeout {
 		touch(paths.KillStamp)
-		emitKillDiag(e, reason, cfg, logFile, rc)
+		printLogTail(e, logFile)
+		r.Error = killError(reason, cfg)
+		r.ExitCode = rc
+		e.Emit(r)
 		rec.ExitCode = rc
 		index.Append(paths.IndexFile, rec)
 		return rc
 	}
 
-	// Normal path. All meta goes to stderr; stdout already holds the raw body.
-	if convID != "" {
-		e.Meta("conversation", map[string]any{
-			"id": convID, "continue_cmd": fmt.Sprintf("agy-run -C %s ...", convID),
-		})
-	}
-
-	bodySize := fileSize(bodyPath)
-
 	// body_file: copy the captured body to a stable per-conversation path.
-	if bodySize > 0 && convID != "" {
+	if len(body) > 0 && convID != "" {
 		if dst, ok := copyBody(paths.LastBodyDir, convID, bodyPath); ok {
-			e.Meta("body_file", map[string]any{"path": dst})
+			r.BodyFile = dst
 		}
 	}
 
@@ -184,26 +196,28 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	arts := convlog.NewImageArtifacts(paths.BrainDir, convID, start)
 	if len(arts) > 0 {
 		rec.Artifacts = arts
-		e.Meta("artifacts", map[string]any{"conversation_id": convID, "files": arts})
+		r.Artifacts = arts
 	}
 
 	// Rate-limit / empty-output detection when agy returned 0 with no body.
-	if rc == config.ExitOK && bodySize == 0 {
+	if rc == config.ExitOK && len(body) == 0 {
 		hits := ratelimit.CountHits(logFile)
 		if hits > 0 {
-			e.Meta("error", map[string]any{
-				"reason": "rate_limited", "log_ratelimit_hits": hits,
-				"hint": "agyの5時間枠/レート上限の可能性。残量を確認し、リセットまで委譲不可（Claude側で実装 or 待機）。",
-			})
+			r.Error = &emit.Error{
+				Reason: "rate_limited", LogRatelimitHits: hits,
+				Hint: "agyの5時間枠/レート上限の可能性。残量を確認し、リセットまで委譲不可（Claude側で実装 or 待機）。",
+			}
 			rc = config.ExitRateLimited
 		} else {
-			e.Meta("error", map[string]any{
-				"reason": "empty_output",
-				"note":   "本文ゼロ。LOG_FILE 末尾を確認（rc は変更しない）。",
-			})
+			r.Error = &emit.Error{
+				Reason: "empty_output",
+				Note:   "本文ゼロ。stderr のログ末尾を確認（rc は変更しない）。",
+			}
 		}
 	}
 
+	r.ExitCode = rc
+	e.Emit(r)
 	rec.ExitCode = rc
 	index.Append(paths.IndexFile, rec)
 	return rc
@@ -224,27 +238,40 @@ func heartbeatPaths(logFile, bodyPath, brainDir, logForConv string) func() []str
 	}
 }
 
-// emitKillDiag emits the stall (exit 44) or timeout (exit 124) diagnostic block
-// to stderr: a blank line, a JSON meta line, then the (non-JSON) log tail.
-func emitKillDiag(e *emit.Emitter, reason watchdog.Reason, cfg config.Config, logFile string, rc int) {
-	e.Plain("\n")
+// killError builds the structured error for a stall (exit 44) or absolute
+// timeout (exit 124), pointing the reader at the stderr log tail.
+func killError(reason watchdog.Reason, cfg config.Config) *emit.Error {
 	if reason == watchdog.Stall {
-		e.Meta("stall", map[string]any{
-			"idle_limit_sec": cfg.IdleLimitSec,
-			"exit_code":      rc,
-			"note":           "heartbeat 途絶（agy 応答停止）。以下はログ末尾（自由テキストのため非JSON）",
-		})
-	} else {
-		e.Meta("timeout", map[string]any{
-			"abs_limit_sec": cfg.AbsLimitSec,
-			"print_timeout": cfg.PrintTimeout,
-			"exit_code":     rc,
-			"note":          "絶対上限に到達。以下はログ末尾（自由テキストのため非JSON）",
-		})
+		return &emit.Error{
+			Reason:       "stall",
+			IdleLimitSec: cfg.IdleLimitSec,
+			Note:         "heartbeat 途絶（agy 応答停止）。stderr にログ末尾を出力。",
+		}
 	}
+	return &emit.Error{
+		Reason:       "timeout",
+		AbsLimitSec:  cfg.AbsLimitSec,
+		PrintTimeout: cfg.PrintTimeout,
+		Note:         "絶対上限に到達。stderr にログ末尾を出力。",
+	}
+}
+
+// printLogTail writes the last few log lines (free text) to stderr for the
+// stall/timeout diagnostics.
+func printLogTail(e *emit.Emitter, logFile string) {
+	e.Plain("\n")
 	if tail := tailLines(logFile, 5); tail != "" {
 		e.Plain(tail)
 	}
+}
+
+// readBody returns the captured agy body, or "" if it cannot be read.
+func readBody(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 // buildArgs assembles the agy argument list (excluding the trailing -p prompt).
@@ -300,14 +327,6 @@ func copyBody(lastBodyDir, convID, srcPath string) (string, bool) {
 		return "", false
 	}
 	return dst, true
-}
-
-func fileSize(path string) int64 {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0
-	}
-	return info.Size()
 }
 
 func cwd() string {

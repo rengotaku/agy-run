@@ -6,42 +6,58 @@ import (
 	"testing"
 )
 
-func TestMetaStreamIsJSON(t *testing.T) {
-	var errb bytes.Buffer
-	e := New(&errb)
-	e.Meta("conversation", map[string]any{"id": "abc", "pid": 123})
+func TestEmitSingleObjectToStdout(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := New(&out, &errb)
+	e.Emit(Result{
+		Body:           "the answer\nsecond line\n",
+		ConversationID: "abc-123",
+		BodyFile:       "/tmp/last-body/abc-123.md",
+		Artifacts:      []string{"/tmp/x.jpg"},
+		ExitCode:       0,
+	})
 
-	var m map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(errb.Bytes()), &m); err != nil {
-		t.Fatalf("meta not json: %v (%q)", err, errb.String())
+	var r Result
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatalf("stdout not a single JSON object: %v (%q)", err, out.String())
 	}
-	if m["agy_run"] != "conversation" {
-		t.Errorf("agy_run = %v", m["agy_run"])
+	if r.Body != "the answer\nsecond line\n" {
+		t.Errorf("body = %q", r.Body)
 	}
-	if m["pid"].(float64) != 123 {
-		t.Errorf("pid = %v", m["pid"])
+	if r.ConversationID != "abc-123" || r.BodyFile == "" || len(r.Artifacts) != 1 {
+		t.Errorf("meta lost: %+v", r)
+	}
+	if r.Error != nil {
+		t.Errorf("error should be nil, got %+v", r.Error)
+	}
+	if errb.Len() != 0 {
+		t.Errorf("stderr should be empty on success, got %q", errb.String())
 	}
 }
 
-func TestSingleKeyOrderingAlwaysHasAgyRun(t *testing.T) {
-	var errb bytes.Buffer
-	e := New(&errb)
-	// A field that would collide with agy_run must not override the event.
-	e.Meta("error", map[string]any{"agy_run": "SHOULD_NOT_WIN", "reason": "x"})
-	var m map[string]any
-	if err := json.Unmarshal(bytes.TrimSpace(errb.Bytes()), &m); err != nil {
+func TestEmitErrorObject(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := New(&out, &errb)
+	e.Emit(Result{ExitCode: 42, Error: &Error{Reason: "rate_limited", LogRatelimitHits: 3}})
+
+	var r Result
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
 	}
-	if m["agy_run"] != "error" {
-		t.Errorf("agy_run = %v, want error", m["agy_run"])
+	if r.ExitCode != 42 || r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("error result = %+v", r)
 	}
 }
 
-func TestPlainGoesToErr(t *testing.T) {
-	var errb bytes.Buffer
-	e := New(&errb)
-	e.Plain("tail line\n")
-	if errb.String() != "tail line\n" {
-		t.Errorf("plain = %q", errb.String())
+func TestNoteAndPlainGoToStderr(t *testing.T) {
+	var out, errb bytes.Buffer
+	e := New(&out, &errb)
+	e.Note("cooldown: waiting 5s")
+	e.Plain("log tail\n")
+	if out.Len() != 0 {
+		t.Errorf("stdout should be empty, got %q", out.String())
+	}
+	if errb.String() != "cooldown: waiting 5s\nlog tail\n" {
+		t.Errorf("stderr = %q", errb.String())
 	}
 }

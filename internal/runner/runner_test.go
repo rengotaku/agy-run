@@ -2,13 +2,25 @@ package runner
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/config"
+	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/emit"
 )
+
+// parseResult decodes the single JSON result object agy-run writes to stdout.
+func parseResult(t *testing.T, out string) emit.Result {
+	t.Helper()
+	var r emit.Result
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatalf("stdout is not a single JSON object: %v\n---\n%s", err, out)
+	}
+	return r
+}
 
 const stubConv = "11111111-1111-1111-1111-111111111111"
 
@@ -67,27 +79,22 @@ func TestRunSuccessContract(t *testing.T) {
 	if rc != config.ExitOK {
 		t.Fatalf("rc = %d, want 0", rc)
 	}
-	// stdout: raw body only — no wrapper JSON, no begin/end markers.
-	if strings.TrimSpace(out) != "hello from agy" {
-		t.Errorf("stdout not body-only: %q", out)
+	// stdout: exactly one JSON result object carrying body + all metadata.
+	r := parseResult(t, out)
+	if !strings.Contains(r.Body, "hello from agy") {
+		t.Errorf("body = %q", r.Body)
 	}
-	if strings.Contains(out, `"agy_run"`) {
-		t.Errorf("stdout leaked meta JSON: %q", out)
+	if r.ConversationID != stubConv {
+		t.Errorf("conversation_id = %q, want %s", r.ConversationID, stubConv)
 	}
-	// stderr: all wrapper meta (conversation + body_file), no begin/end.
-	for _, want := range []string{
-		`"agy_run":"conversation"`,
-		stubConv,
-		`"agy_run":"body_file"`,
-	} {
-		if !strings.Contains(errb, want) {
-			t.Errorf("stderr missing %q\n---\n%s", want, errb)
-		}
+	if r.BodyFile == "" {
+		t.Errorf("body_file not set: %+v", r)
 	}
-	for _, unwanted := range []string{`"agy_run":"begin"`, `"agy_run":"end"`} {
-		if strings.Contains(errb, unwanted) {
-			t.Errorf("stderr still has retired marker %q\n---\n%s", unwanted, errb)
-		}
+	if r.ExitCode != 0 || r.Error != nil {
+		t.Errorf("expected clean success, got exit=%d err=%+v", r.ExitCode, r.Error)
+	}
+	if errb != "" {
+		t.Errorf("stderr should be empty on clean success, got %q", errb)
 	}
 
 	// body_file materialized on disk with the raw body.
@@ -121,12 +128,16 @@ func TestRunRateLimited(t *testing.T) {
 	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted")
 	t.Setenv("STUB_EXIT", "0")
 
-	rc, _, errb := run(t, home, []string{"do work"})
+	rc, out, _ := run(t, home, []string{"do work"})
 	if rc != config.ExitRateLimited {
 		t.Fatalf("rc = %d, want 42", rc)
 	}
-	if !strings.Contains(errb, `"reason":"rate_limited"`) {
-		t.Errorf("stderr missing rate_limited: %s", errb)
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("result missing rate_limited error: %+v", r)
+	}
+	if r.ExitCode != config.ExitRateLimited {
+		t.Errorf("result exit_code = %d, want 42", r.ExitCode)
 	}
 }
 
@@ -135,12 +146,13 @@ func TestRunEmptyOutput(t *testing.T) {
 	t.Setenv("STUB_BODY", "")
 	t.Setenv("STUB_EXIT", "0")
 
-	rc, _, errb := run(t, home, []string{"do work"})
+	rc, out, _ := run(t, home, []string{"do work"})
 	if rc != config.ExitOK {
 		t.Fatalf("rc = %d, want 0", rc)
 	}
-	if !strings.Contains(errb, `"reason":"empty_output"`) {
-		t.Errorf("stderr missing empty_output: %s", errb)
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "empty_output" {
+		t.Errorf("result missing empty_output error: %+v", r)
 	}
 }
 
@@ -153,19 +165,17 @@ func TestRunStallExit44(t *testing.T) {
 	t.Setenv("AGY_RUN_IDLE_LIMIT", "1")
 	t.Setenv("AGY_RUN_POLL", "1")
 
-	rc, out, errb := run(t, home, []string{"long task"})
+	rc, out, _ := run(t, home, []string{"long task"})
 	if rc != config.ExitStall {
 		t.Fatalf("rc = %d, want 44 (stall)", rc)
 	}
-	// Partial body reached stdout raw; the stall diag (with exit_code) is stderr.
-	if strings.Contains(out, `"agy_run"`) {
-		t.Errorf("stdout leaked meta JSON: %q", out)
+	// The stall is reported in the single result object: error + exit_code 44.
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "stall" {
+		t.Errorf("result missing stall error: %+v", r)
 	}
-	if !strings.Contains(errb, `"agy_run":"stall"`) {
-		t.Errorf("stderr missing stall diag: %s", errb)
-	}
-	if !strings.Contains(errb, `"exit_code":44`) {
-		t.Errorf("stall diag missing exit_code 44: %s", errb)
+	if r.ExitCode != config.ExitStall {
+		t.Errorf("result exit_code = %d, want 44", r.ExitCode)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "antigravity-cli", ".agy-run.last-kill")); err != nil {
 		t.Errorf("kill stamp not created: %v", err)
@@ -181,8 +191,11 @@ func TestRunPassesThroughAgyExitCode(t *testing.T) {
 	if rc != 7 {
 		t.Fatalf("rc = %d, want 7", rc)
 	}
-	// Exit code is carried by the process result, not a stdout end marker.
-	if strings.TrimSpace(out) != "partial" {
-		t.Errorf("stdout not body-only: %q", out)
+	r := parseResult(t, out)
+	if r.ExitCode != 7 {
+		t.Errorf("result exit_code = %d, want 7", r.ExitCode)
+	}
+	if !strings.Contains(r.Body, "partial") {
+		t.Errorf("body = %q", r.Body)
 	}
 }

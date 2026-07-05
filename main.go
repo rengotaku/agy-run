@@ -1,11 +1,11 @@
 // Command agy-run is a safe wrapper around the agy (Antigravity CLI) binary.
 //
-// The output contract separates streams the Unix way: stdout carries the agy
-// body only (raw text, no markers), while stderr carries all wrapper metadata
-// as single-key {"agy_run":...} JSON Lines. Process supervision —
-// bounded-parallel slot locking, post-kill cooldown, process-group kill, and
-// the idle+absolute watchdog — lives in Go, where signals, concurrency, and
-// structured JSON are the right tools for the job.
+// The output contract is a single JSON object on stdout describing the whole
+// outcome (body plus conversation/body_file/artifacts/exit_code/error); human
+// diagnostics go to stderr. Process supervision — bounded-parallel slot
+// locking, post-kill cooldown, process-group kill, and the idle+absolute
+// watchdog — lives in Go, where signals, concurrency, and structured JSON are
+// the right tools for the job.
 //
 // Exit codes: 0 success / 2 usage / 4 slot lock timeout / 42 rate_limited /
 // 44 idle stall / 124 absolute timeout / else agy's own code.
@@ -16,6 +16,7 @@ import (
 	"os"
 
 	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/config"
+	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/emit"
 	"github.com/rengotaku/dotfiles-ubuntu/linux/cmd/agy-run/internal/runner"
 )
 
@@ -43,9 +44,13 @@ exit code: 0=成功 / 2=引数エラー / 4=ロック待ちタイムアウト /
 `
 
 func main() {
+	e := emit.New(os.Stdout, os.Stderr)
+
 	cfg, wantHelp, err := config.Parse(os.Args[1:], os.Getenv)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "{\"agy_run\":\"error\",\"reason\":\"bad_option\",\"detail\":%q}\n", err.Error())
+		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+			Reason: "bad_option", Detail: err.Error(),
+		}})
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(config.ExitUsage)
 	}
@@ -54,14 +59,16 @@ func main() {
 		os.Exit(config.ExitOK)
 	}
 	if cfg.Prompt == "" {
-		fmt.Fprintln(os.Stderr, `{"agy_run":"error","reason":"missing_prompt"}`)
+		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{Reason: "missing_prompt"}})
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(config.ExitUsage)
 	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "{\"agy_run\":\"error\",\"reason\":\"no_home\",\"detail\":%q}\n", err.Error())
+		e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+			Reason: "no_home", Detail: err.Error(),
+		}})
 		os.Exit(config.ExitUsage)
 	}
 
