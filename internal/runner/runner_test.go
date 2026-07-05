@@ -63,21 +63,30 @@ func TestRunSuccessContract(t *testing.T) {
 	t.Setenv("STUB_BODY", "hello from agy")
 	t.Setenv("STUB_EXIT", "0")
 
-	rc, out, _ := run(t, home, []string{"say hi"})
+	rc, out, errb := run(t, home, []string{"say hi"})
 	if rc != config.ExitOK {
 		t.Fatalf("rc = %d, want 0", rc)
 	}
+	// stdout: raw body only — no wrapper JSON, no begin/end markers.
+	if strings.TrimSpace(out) != "hello from agy" {
+		t.Errorf("stdout not body-only: %q", out)
+	}
+	if strings.Contains(out, `"agy_run"`) {
+		t.Errorf("stdout leaked meta JSON: %q", out)
+	}
+	// stderr: all wrapper meta (conversation + body_file), no begin/end.
 	for _, want := range []string{
-		`{"agy_run":"begin"`,
-		"hello from agy",
-		`"agy_run":"end"`,
-		`"exit_code":0`,
 		`"agy_run":"conversation"`,
 		stubConv,
 		`"agy_run":"body_file"`,
 	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("stdout missing %q\n---\n%s", want, out)
+		if !strings.Contains(errb, want) {
+			t.Errorf("stderr missing %q\n---\n%s", want, errb)
+		}
+	}
+	for _, unwanted := range []string{`"agy_run":"begin"`, `"agy_run":"end"`} {
+		if strings.Contains(errb, unwanted) {
+			t.Errorf("stderr still has retired marker %q\n---\n%s", unwanted, errb)
 		}
 	}
 
@@ -148,11 +157,15 @@ func TestRunStallExit44(t *testing.T) {
 	if rc != config.ExitStall {
 		t.Fatalf("rc = %d, want 44 (stall)", rc)
 	}
-	if !strings.Contains(out, `"exit_code":44`) {
-		t.Errorf("end line missing exit_code 44: %s", out)
+	// Partial body reached stdout raw; the stall diag (with exit_code) is stderr.
+	if strings.Contains(out, `"agy_run"`) {
+		t.Errorf("stdout leaked meta JSON: %q", out)
 	}
 	if !strings.Contains(errb, `"agy_run":"stall"`) {
 		t.Errorf("stderr missing stall diag: %s", errb)
+	}
+	if !strings.Contains(errb, `"exit_code":44`) {
+		t.Errorf("stall diag missing exit_code 44: %s", errb)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".gemini", "antigravity-cli", ".agy-run.last-kill")); err != nil {
 		t.Errorf("kill stamp not created: %v", err)
@@ -168,7 +181,8 @@ func TestRunPassesThroughAgyExitCode(t *testing.T) {
 	if rc != 7 {
 		t.Fatalf("rc = %d, want 7", rc)
 	}
-	if !strings.Contains(out, `"exit_code":7`) {
-		t.Errorf("end line missing exit_code 7: %s", out)
+	// Exit code is carried by the process result, not a stdout end marker.
+	if strings.TrimSpace(out) != "partial" {
+		t.Errorf("stdout not body-only: %q", out)
 	}
 }

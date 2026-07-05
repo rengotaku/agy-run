@@ -1,7 +1,8 @@
 // Package runner orchestrates a single agy-run invocation: concurrency slot,
 // post-kill cooldown, process launch with an idle/absolute watchdog, and the
-// full output contract (begin/body/end + conversation/body_file/artifacts and
-// the rate-limit / empty-output / stall / timeout diagnostics).
+// output contract — the agy body flows raw to stdout while all wrapper meta
+// (conversation/body_file/artifacts and the rate-limit / empty-output / stall /
+// timeout diagnostics) goes to stderr as {"agy_run":...} JSON.
 package runner
 
 import (
@@ -36,7 +37,7 @@ type Options struct {
 
 // Run executes one invocation and returns the process exit code.
 func Run(cfg config.Config, opt Options) int {
-	e := emit.New(opt.Stdout, opt.Stderr)
+	e := emit.New(opt.Stderr)
 	paths := DefaultPaths(opt.Home, opt.Getenv)
 
 	// Ensure the state dir exists so the slot lock files can be created even on
@@ -104,7 +105,6 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 
 	args := buildArgs(cfg, logFile)
 
-	e.Body("begin", map[string]any{"pid": os.Getpid()})
 	tsStart := start.Format(time.RFC3339)
 
 	devnull, _ := os.Open(os.DevNull)
@@ -123,8 +123,7 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 
 	if serr := cmd.Start(); serr != nil {
 		_ = bodyCap.Close()
-		e.Body("end", map[string]any{"pid": os.Getpid(), "exit_code": 127})
-		e.Meta("error", map[string]any{"reason": "spawn_failed", "detail": serr.Error()})
+		e.Meta("error", map[string]any{"reason": "spawn_failed", "detail": serr.Error(), "exit_code": 127})
 		return 127
 	}
 
@@ -146,7 +145,6 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 
 	end := timeNow()
 	rc := exitCode(cmd, waitErr, reason)
-	e.Body("end", map[string]any{"pid": os.Getpid(), "exit_code": rc})
 
 	convID := convlog.ResolveConvID(logFile)
 
@@ -167,16 +165,15 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	// Stall / absolute-timeout branches: kill diagnostics, then index + exit.
 	if reason == watchdog.Stall || reason == watchdog.AbsTimeout {
 		touch(paths.KillStamp)
-		emitKillDiag(e, reason, cfg, logFile)
+		emitKillDiag(e, reason, cfg, logFile, rc)
 		rec.ExitCode = rc
 		index.Append(paths.IndexFile, rec)
 		return rc
 	}
 
-	// Normal path.
+	// Normal path. All meta goes to stderr; stdout already holds the raw body.
 	if convID != "" {
-		e.Blank()
-		e.Body("conversation", map[string]any{
+		e.Meta("conversation", map[string]any{
 			"id": convID, "continue_cmd": fmt.Sprintf("agy-run -C %s ...", convID),
 		})
 	}
@@ -186,7 +183,7 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	// body_file: copy the captured body to a stable per-conversation path.
 	if bodySize > 0 && convID != "" {
 		if dst, ok := copyBody(paths.LastBodyDir, convID, bodyPath); ok {
-			e.Body("body_file", map[string]any{"path": dst})
+			e.Meta("body_file", map[string]any{"path": dst})
 		}
 	}
 
@@ -194,7 +191,7 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	arts := convlog.NewImageArtifacts(paths.BrainDir, convID, start)
 	if len(arts) > 0 {
 		rec.Artifacts = arts
-		e.Body("artifacts", map[string]any{"conversation_id": convID, "files": arts})
+		e.Meta("artifacts", map[string]any{"conversation_id": convID, "files": arts})
 	}
 
 	// Rate-limit / empty-output detection when agy returned 0 with no body.
@@ -234,19 +231,21 @@ func heartbeatPaths(logFile, bodyPath, brainDir, logForConv string) func() []str
 	}
 }
 
-// emitKillDiag emits the stall (exit 44) or timeout (exit 124) diagnostic block:
-// a blank line, a JSON meta line, then the (non-JSON) log tail.
-func emitKillDiag(e *emit.Emitter, reason watchdog.Reason, cfg config.Config, logFile string) {
+// emitKillDiag emits the stall (exit 44) or timeout (exit 124) diagnostic block
+// to stderr: a blank line, a JSON meta line, then the (non-JSON) log tail.
+func emitKillDiag(e *emit.Emitter, reason watchdog.Reason, cfg config.Config, logFile string, rc int) {
 	e.Plain("\n")
 	if reason == watchdog.Stall {
 		e.Meta("stall", map[string]any{
 			"idle_limit_sec": cfg.IdleLimitSec,
+			"exit_code":      rc,
 			"note":           "heartbeat 途絶（agy 応答停止）。以下はログ末尾（自由テキストのため非JSON）",
 		})
 	} else {
 		e.Meta("timeout", map[string]any{
 			"abs_limit_sec": cfg.AbsLimitSec,
 			"print_timeout": cfg.PrintTimeout,
+			"exit_code":     rc,
 			"note":          "絶対上限に到達。以下はログ末尾（自由テキストのため非JSON）",
 		})
 	}

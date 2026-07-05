@@ -1,15 +1,18 @@
-// Package emit writes the agy-run output contract: single-key {"agy_run":...}
-// JSON Lines for wrapper metadata, and raw body text between begin/end markers.
+// Package emit writes the agy-run metadata contract: single-key
+// {"agy_run":...} JSON Lines, all on the diagnostic (stderr) stream.
 //
-// Contract (consumed mechanically by callers — Claude / improve-loop / skills):
-//   - every wrapper line is one JSON object whose sole top-level key is "agy_run"
-//   - the agy body is the raw text between the "begin" and "end" lines
-//   - meta lines (note/cooldown/error/timeout/stall/conversation/body_file/
-//     artifacts) never appear between begin and end
+// Stream contract (Unix / clig.dev convention — consumed mechanically by
+// callers: Claude / improve-loop / skills):
+//   - stdout carries the agy body only — raw text, no markers, no JSON. The
+//     body flows straight from agy's stdout, so `agy-run ... 2>/dev/null`
+//     yields the body alone and EOF is the terminator (no begin/end markers).
+//   - stderr carries every wrapper line: diagnostics and structured meta. Each
+//     meta line is one JSON object whose sole top-level key is "agy_run"
+//     (note/cooldown/error/timeout/stall/conversation/body_file/artifacts).
 //
-// All lines are produced with encoding/json so values are always correctly
-// escaped (this replaces the hand-built echo/jq lines of the bash version and
-// removes the class of jq-escaping bugs).
+// All meta lines are produced with encoding/json so values are always correctly
+// escaped, and — since they never touch stdout — can never collide with body
+// text that happens to contain a `{"agy_run":...}`-shaped line.
 package emit
 
 import (
@@ -18,16 +21,16 @@ import (
 	"io"
 )
 
-// Emitter serializes contract lines to an output (stdout) and error (stderr)
-// stream. Body text flows to the Out stream between Begin and End.
+// Emitter serializes metadata contract lines to the diagnostic (stderr) stream.
+// The agy body itself is written directly to stdout by the runner (via an
+// io.MultiWriter), never through the Emitter — keeping stdout body-only.
 type Emitter struct {
-	Out io.Writer // contract lines that are part of the body stream (begin/end/conversation/body_file/artifacts)
-	Err io.Writer // diagnostic/meta lines (note/cooldown/error/timeout/stall)
+	Err io.Writer // diagnostic/meta lines (all agy_run JSON + free-text log tails)
 }
 
-// New returns an Emitter writing to out (stdout) and err (stderr).
-func New(out, err io.Writer) *Emitter {
-	return &Emitter{Out: out, Err: err}
+// New returns an Emitter writing to err (stderr).
+func New(err io.Writer) *Emitter {
+	return &Emitter{Err: err}
 }
 
 // line marshals fields into a single {"agy_run":<event>,...} JSON object and
@@ -47,23 +50,12 @@ func line(w io.Writer, event string, fields map[string]any) error {
 	return err
 }
 
-// Meta writes a contract line to the error (diagnostic) stream.
+// Meta writes a contract line to the diagnostic (stderr) stream.
 func (e *Emitter) Meta(event string, fields map[string]any) {
 	_ = line(e.Err, event, fields)
 }
 
-// Body writes a contract line to the output (body) stream.
-func (e *Emitter) Body(event string, fields map[string]any) {
-	_ = line(e.Out, event, fields)
-}
-
-// Blank writes a bare newline to the output stream (matches the bash spacing
-// before the conversation footer).
-func (e *Emitter) Blank() {
-	_, _ = fmt.Fprintln(e.Out)
-}
-
-// Plain writes free text (non-JSON) to the error stream. Used only for the
+// Plain writes free text (non-JSON) to the diagnostic stream. Used only for the
 // timeout/stall log tail, which is intentionally not JSON-wrapped.
 func (e *Emitter) Plain(s string) {
 	_, _ = fmt.Fprint(e.Err, s)

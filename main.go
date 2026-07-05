@@ -1,11 +1,11 @@
 // Command agy-run is a safe wrapper around the agy (Antigravity CLI) binary.
 //
-// It preserves the output contract and exit codes of the original zsh wrapper
-// (single-key {"agy_run":...} JSON Lines for metadata; raw body between the
-// begin/end markers) while moving process supervision — bounded-parallel slot
-// locking, post-kill cooldown, process-group kill, and the new idle+absolute
-// watchdog — into Go, where signals, concurrency, and structured JSON are the
-// right tools for the job.
+// The output contract separates streams the Unix way: stdout carries the agy
+// body only (raw text, no markers), while stderr carries all wrapper metadata
+// as single-key {"agy_run":...} JSON Lines. Process supervision —
+// bounded-parallel slot locking, post-kill cooldown, process-group kill, and
+// the idle+absolute watchdog — lives in Go, where signals, concurrency, and
+// structured JSON are the right tools for the job.
 //
 // Exit codes: 0 success / 2 usage / 4 slot lock timeout / 42 rate_limited /
 // 44 idle stall / 124 absolute timeout / else agy's own code.
