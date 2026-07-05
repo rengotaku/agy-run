@@ -44,13 +44,6 @@ func Run(cfg config.Config, opt Options) int {
 	// a fresh machine (agy normally creates it, but do not depend on that).
 	_ = os.MkdirAll(paths.StateDir, 0o755)
 
-	// Existing agy processes: warn only (concurrency is not the hang cause).
-	if pids := existingAgyPIDs(os.Getpid()); len(pids) > 0 {
-		e.Meta("note", map[string]any{
-			"event": "concurrent_agy_process", "pids": pids, "safe": true,
-		})
-	}
-
 	// Guard 1: cooldown after a prior kill (avoids the exit-144 instant death).
 	cooldown(e, paths.KillStamp)
 
