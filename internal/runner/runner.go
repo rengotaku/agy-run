@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -89,7 +90,15 @@ func Run(cfg config.Config, opt Options) int {
 	}
 	defer h.Release()
 
-	return execute(cfg, opt, e, paths)
+	// Signal-aware context: a received SIGINT/SIGTERM/SIGHUP cancels the run so
+	// the agy child (and its whole process group) is torn down instead of being
+	// orphaned when agy-run itself is terminated by its launcher — orphaned agy
+	// processes otherwise linger for days holding inotify watches (issue #7).
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer stop()
+
+	return execute(ctx, cfg, opt, e, paths)
 }
 
 // cooldown sleeps out the remainder of the post-kill cooldown window if a kill
@@ -110,14 +119,14 @@ func cooldown(e *emit.Emitter, killStamp string) {
 // emits the single result object exactly once. All physical agy runs happen
 // inside the already-acquired concurrency slot; only rate_limited triggers a
 // retry (fall to the next -m candidate, then optionally wait out the quota).
-func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
+func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 	preflight := workspace.Preflight(effectiveWorkDir(cfg), paths.Settings)
 
 	models := cfg.Models()
 	waited := false
 	for i := 0; ; {
 		model := models[i]
-		r, rc, logFile := attempt(cfg, model, opt, e, paths)
+		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
 
 		if rc == config.ExitRateLimited {
 			// Model fallback: try the next candidate from -m "A,B,...".
@@ -165,7 +174,7 @@ func execute(cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
 // exit code and log path. It never emits the contract object — execute() owns
 // the single stdout write so retries do not duplicate it. Stall/timeout log
 // tails still go to stderr here, since they are per-physical-run diagnostics.
-func attempt(cfg config.Config, model string, opt Options, e *emit.Emitter, paths Paths) (emit.Result, int, string) {
+func attempt(ctx context.Context, cfg config.Config, model string, opt Options, e *emit.Emitter, paths Paths) (emit.Result, int, string) {
 	if err := os.MkdirAll(paths.LogDir, 0o755); err != nil {
 		return errResult("logdir_error", err), config.ExitUsage, ""
 	}
@@ -188,16 +197,26 @@ func attempt(cfg config.Config, model string, opt Options, e *emit.Emitter, path
 		defer func() { _ = devnull.Close() }()
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// runCtx is per-attempt (cancelled between fallback retries) but inherits the
+	// signal-aware parent ctx, so a received signal cancels the in-flight agy too.
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// agy's stdout is captured (not forwarded live): the raw body is folded into
 	// the final JSON result, so nothing but that one object reaches our stdout.
-	cmd := commandContext(ctx, paths.AgyBin, append(args, "-p", cfg.Prompt))
+	cmd := commandContext(runCtx, paths.AgyBin, append(args, "-p", cfg.Prompt))
 	cmd.Stdin = devnull
 	cmd.Stdout = bodyCap
 	cmd.Stderr = opt.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// On any runCtx cancellation (a received signal, or normal teardown) kill
+	// agy's WHOLE process group, not just the direct child, so no descendant is
+	// orphaned (issue #7). WaitDelay caps how long Wait() blocks afterward when a
+	// grandchild keeps an inherited output pipe open — this only arises when
+	// Stderr is not a raw *os.File (e.g. the test harness); it is harmless in the
+	// production path where Stderr is os.Stderr.
+	cmd.Cancel = func() error { return killGroup(cmd.Process) }
+	cmd.WaitDelay = 2 * time.Second
 	if cfg.Workspace != "" {
 		cmd.Dir = cfg.Workspace // pin agy's cwd so RUN_COMMAND resolves correctly (issue #1)
 	}
@@ -216,7 +235,7 @@ func attempt(cfg config.Config, model string, opt Options, e *emit.Emitter, path
 		Paths: heartbeatPaths(logFile, bodyPath, paths.BrainDir, logFile),
 	}
 	reasonCh := make(chan watchdog.Reason, 1)
-	go func() { reasonCh <- w.Run(ctx, func() { killGroup(cmd.Process) }) }()
+	go func() { reasonCh <- w.Run(runCtx, func() { _ = killGroup(cmd.Process) }) }()
 
 	waitErr := cmd.Wait()
 	cancel()
@@ -489,10 +508,15 @@ func copyBody(lastBodyDir, convID, srcPath string) (string, bool) {
 }
 
 // killGroup sends SIGKILL to the whole process group (Setpgid gave the child its
-// own group whose id equals its pid), ensuring agy and its children all die.
-func killGroup(p *os.Process) {
+// own group whose id equals its pid), ensuring agy and its children all die. It
+// returns os.ErrProcessDone when the process/group is already gone, matching the
+// exec.Cmd.Cancel convention; the watchdog callback ignores the return.
+func killGroup(p *os.Process) error {
 	if p == nil {
-		return
+		return os.ErrProcessDone
 	}
-	_ = syscall.Kill(-p.Pid, syscall.SIGKILL)
+	if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		return err
+	}
+	return nil
 }
