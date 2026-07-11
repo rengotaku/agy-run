@@ -29,7 +29,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
 使い方:
   agy-run [-t <dur>] [-m <model[,fallback...]>] [-c | -C <conversation-id>]
           [-w <lock-wait-sec>] [-W <workspace-dir>] [--wait-quota]
-          [-d] [-a <extra-arg>]... <prompt>
+          [-d] [-a <extra-arg>]... [--sandbox] <prompt>
 
 フラグ:
     -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）。
@@ -51,6 +51,9 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     -a  agy へそのまま渡す追加引数（繰り返し可。例: -a --add-dir -a /path/to/repo）
     --wait-quota  rate_limited かつログに "Resets in ..." があれば、リセットまで
         1回だけ待機して再試行（上限 AGY_RUN_MAX_QUOTA_WAIT）。
+    --sandbox  bwrap でファイルシステム隔離した中で agy を実行し、全 HTTP(S) 通信を
+        ~/.gemini/antigravity-cli/log/net-access.jsonl に記録する（通信は遮断しない）。
+        AGY_RUN_SANDBOX=1 でも有効化可。bwrap 未導入なら実行前に exit 2（詳細は README）。
     -h  このヘルプを表示
 
 注意（agy の書き込み先）:
@@ -82,6 +85,9 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     AGY_RUN_ABS_LIMIT        絶対上限秒（既定 3600 = 60分。超過で exit 124）
     AGY_RUN_POLL             watchdog ポーリング秒（既定 20）
     AGY_RUN_MAX_QUOTA_WAIT   --wait-quota の待機上限秒（既定 14400 = 4時間）
+    AGY_RUN_SANDBOX          --sandbox と同じ（1/true/yes などで有効）
+    AGY_RUN_SANDBOX_RO_BINDS 追加の読み取り専用 bind（コロン区切り、存在しないパスは無視）
+    AGY_RUN_SANDBOX_RW_BINDS 追加の書き込み可 bind（コロン区切り、存在しないパスは無視）
 
 出力（stdout = JSON 1個。stderr は cooldown 通知や stall/timeout のログ末尾など人向けのみ）:
     {
@@ -92,6 +98,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
       "model":                "実際に使用したモデル（-m 指定時）",
       "warnings":             ["非致命の警告（workspace 不一致 / RUN_COMMAND 失敗）", ...],
       "run_command_failures": 0,    // agy の build/test 失敗件数（>0 は自己申告要再検証）
+      "net_log":              "/path/to/net-access.jsonl",  // --sandbox 時のみ
       "exit_code":            0,
       "error":                null   // 失敗時のみ {"reason": ..., "detail": ...}
     }

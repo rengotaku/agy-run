@@ -185,6 +185,48 @@ func TestModelsList(t *testing.T) {
 	}
 }
 
+func TestParseSandboxFlag(t *testing.T) {
+	cfg, _, err := Parse([]string{"--sandbox", "do"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Sandbox {
+		t.Error("sandbox not set by --sandbox")
+	}
+}
+
+func TestParseSandboxEnv(t *testing.T) {
+	cases := map[string]bool{
+		"1":     true,
+		"true":  true,
+		"TRUE":  true,
+		"yes":   true,
+		"":      false,
+		"0":     false,
+		"false": false,
+		"FALSE": false,
+	}
+	for v, want := range cases {
+		cfg, _, err := Parse([]string{"do"}, mapEnv(map[string]string{"AGY_RUN_SANDBOX": v}))
+		if err != nil {
+			t.Fatalf("AGY_RUN_SANDBOX=%q: %v", v, err)
+		}
+		if cfg.Sandbox != want {
+			t.Errorf("AGY_RUN_SANDBOX=%q: sandbox = %v, want %v", v, cfg.Sandbox, want)
+		}
+	}
+}
+
+func TestParseSandboxDefaultOff(t *testing.T) {
+	cfg, _, err := Parse([]string{"do"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sandbox {
+		t.Error("sandbox should default to false")
+	}
+}
+
 func TestParseUnknownLongOption(t *testing.T) {
 	if _, _, err := Parse([]string{"--bogus", "x"}, mapEnv(nil)); err == nil {
 		t.Error("expected error for unknown long option")

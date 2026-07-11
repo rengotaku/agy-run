@@ -45,6 +45,46 @@ agy は起動 cwd を無視し、`trustedWorkspaces`（`~/.gemini/antigravity-cl
 - 委譲実務では、実装後に `main/` の該当差分を目的の worktree へ手移送する
   （`git -C main diff -- <files>` → `git -C main restore -- <files>` → `git -C <wt> apply <patch>`）。
 
+## サンドボックス (`--sandbox`)
+
+`--sandbox`（または `AGY_RUN_SANDBOX=1`）を付けると、agy を [bwrap](https://github.com/containers/bubblewrap)
+でファイルシステム隔離した中で実行し、実行中の **全 HTTP(S) 通信** を単一の JSONL ストリームへ記録する。
+通信の allowlist / 遮断は一切行わない（記録専用）。無効時（既定）は挙動が一切変わらない。
+
+```bash
+agy-run --sandbox "issue #42 を実装して"
+AGY_RUN_SANDBOX=1 agy-run -W ~/code/myrepo/main -d "調査してほしい内容..."
+```
+
+- **記録先**: `~/.gemini/antigravity-cli/log/net-access.jsonl`（全 run・全並列スロットが同一ファイルに追記。ローテーションなし）
+- **記録内容**: 1接続=1行の JSON（`ts` / `run_id` / `method` / `host` / `port` / `bytes_up` / `bytes_down` / `duration_s`。ダイアル失敗時は `error` も付く）
+- **結果 JSON**: `--sandbox` 実行時のみ `net_log` にログファイルの絶対パスが入る
+- **bwrap 未導入**: 実行前に `exit 2`（`error.reason: "bwrap_not_found"`）。フォールバック実行はしない
+
+### bind 一覧（最小構成、issue #11 の PoC を踏襲）
+
+読み取り専用: `/usr`（+ `/bin` `/lib` `/lib64` `/sbin` は symlink かディレクトリのまま複製）、`/etc/ssl`、
+`/etc/resolv.conf` `/etc/hosts` `/etc/passwd` `/etc/group` `/etc/machine-id`（存在すれば）、`~/.local`
+（agy / agy-run 本体）、`~/.gemini/config/*` の **symlink 先の実体パス**（`skills.json` / `rules/` 等。
+dotfiles がどこにあっても `EvalSymlinks` で追従する）。
+
+読み書き: `~/.gemini`（認証・conversations・brain・slot ファイル）、D-Bus セッションソケット
+（`DBUS_SESSION_BUS_ADDRESS` から解決。agy の OAuth トークンは Secret Service 経由で保存されており、
+このソケットを bind しないと再ログイン要求で落ちる）、cwd（`--chdir` も同じパス）。cwd が git worktree
+（`.git` がファイル）の場合は、その `gitdir` と `commondir` が worktree の親ディレクトリ配下にあるときに限り
+追加で読み書き bind する（symphony 方式。親ディレクトリの外に解決される場合は信用せずスキップする）。
+
+追加の bind が要るときは `AGY_RUN_SANDBOX_RO_BINDS` / `AGY_RUN_SANDBOX_RW_BINDS`（コロン区切り、
+存在しないパスは黙ってスキップ）で指定する。
+
+### 記録の制限
+
+- **プロキシ env を無視する通信は記録に載らない**（生 UDP・QUIC・env を読まないプロセス等）。
+  そうした通信も **遮断はしない**（要件どおり無制限）ため、完全な捕捉が必要な場合は
+  `--unshare-net` + パケットキャプチャ方式への発展が別途必要（本実装は不採用）。
+- **D-Bus セッションバスを bind するため、サンドボックス内から D-Bus 経由のホスト操作が可能**
+  （隔離の穴）。将来的に `xdg-dbus-proxy --filter` で `org.freedesktop.secrets` のみへ絞れる。
+
 ## ビルド
 
 ```bash

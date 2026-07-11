@@ -421,6 +421,44 @@ func TestRunWorkspacePreflightWarns(t *testing.T) {
 	}
 }
 
+// TestRunSandboxRequiresBwrap (issue #11): --sandbox without bwrap on PATH
+// must fail fast, before touching the slot/cooldown machinery, with a clear
+// error — never silently falling back to an unsandboxed run.
+func TestRunSandboxRequiresBwrap(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "should not run")
+	t.Setenv("PATH", home) // no bwrap anywhere on this PATH
+
+	rc, out, _ := run(t, home, []string{"--sandbox", "hi"})
+	if rc != config.ExitUsage {
+		t.Fatalf("rc = %d, want 2 (usage)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "bwrap_not_found" {
+		t.Fatalf("expected bwrap_not_found error, got %+v", r)
+	}
+}
+
+// TestRunWithoutSandboxHasNoNetLogField: the default (non-sandbox) path must
+// stay byte-for-byte unchanged — result.net_log is only ever set when
+// --sandbox/AGY_RUN_SANDBOX actually ran the attempt under bwrap.
+func TestRunWithoutSandboxHasNoNetLogField(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello")
+
+	rc, out, _ := run(t, home, []string{"hi"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	if r.NetLog != "" {
+		t.Errorf("net_log = %q, want empty when --sandbox is not set", r.NetLog)
+	}
+	if strings.Contains(out, "net_log") {
+		t.Errorf("stdout JSON should omit net_log entirely, got: %s", out)
+	}
+}
+
 func TestRunPassesThroughAgyExitCode(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "partial")
