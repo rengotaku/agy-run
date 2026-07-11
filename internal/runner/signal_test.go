@@ -155,3 +155,75 @@ func TestSIGTERMReapsAgyGroup(t *testing.T) {
 
 	deadWithin(t, grand, 3*time.Second)
 }
+
+// TestDetachSurvivesLauncherGroupTeardown (issue #9): when agy-run is launched
+// inside the LAUNCHER's process group (as Claude's background Bash does) and that
+// whole group is torn down (`kill -- -<launcher pgid>`), agy-run must have
+// detached into its own process group and keep running to completion — the
+// delegation must not die with the launcher. Counterpart to
+// TestSIGTERMReapsAgyGroup, which asserts a signal to agy-run ITSELF still reaps
+// agy (the #7/#8 orphan fix stays intact).
+func TestDetachSurvivesLauncherGroupTeardown(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+
+	bin := filepath.Join(t.TempDir(), "agy-run-bin")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "../.." // module root (the main package)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build agy-run: %v\n%s", err, out)
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gpidFile := filepath.Join(t.TempDir(), "gpid")
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(grandchildStub(gpidFile)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agyrunPidFile := filepath.Join(t.TempDir(), "agyrun_pid")
+
+	// The launcher: a shell that starts agy-run as a background child in ITS OWN
+	// process group (no per-child setpgid), mirroring Claude's background Bash.
+	script := bin + " hang please & echo $! > " + agyrunPidFile + "\nwait\n"
+	launcher := exec.Command("sh", "-c", script)
+	launcher.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_DATA_HOME="+filepath.Join(home, "data"))
+	// Give the launcher its own process group so we tear down THAT group (and only
+	// it) — exactly the `kill -- -<pgid>` a background-task teardown performs.
+	launcher.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := launcher.Start(); err != nil {
+		t.Fatalf("start launcher: %v", err)
+	}
+	launcherPGID := launcher.Process.Pid // leader: pgid == pid
+	defer func() { _ = syscall.Kill(-launcherPGID, syscall.SIGKILL) }()
+
+	// Waiting for agy's grandchild guarantees agy-run has already spawned agy,
+	// which happens long after detachFromLauncher() at the top of Run().
+	grand := waitPIDFile(t, gpidFile)
+	agyrunPid := waitPIDFile(t, agyrunPidFile)
+	defer func() { _ = syscall.Kill(-agyrunPid, syscall.SIGKILL) }()
+
+	// Tear down the launcher's whole process group.
+	if err := syscall.Kill(-launcherPGID, syscall.SIGTERM); err != nil {
+		t.Fatalf("kill launcher group: %v", err)
+	}
+	_, _ = launcher.Process.Wait()
+
+	// The delegation must survive: agy-run detached, so the group teardown missed
+	// it and agy (its grandchild) is still alive a beat later.
+	time.Sleep(1 * time.Second)
+	if !pidAlive(agyrunPid) {
+		t.Fatalf("agy-run (pid %d) was killed by the launcher-group teardown — detach failed", agyrunPid)
+	}
+	if !pidAlive(grand) {
+		t.Fatalf("agy (grandchild pid %d) died with the launcher — delegation was cut short", grand)
+	}
+}
