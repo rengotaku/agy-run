@@ -37,9 +37,13 @@ type Result struct {
 	Warnings []string `json:"warnings,omitempty"`
 	// RunCommandFailures counts agy RUN_COMMAND (build/test) steps that failed
 	// in this run's log. >0 means agy's "tests are green" claim needs re-checking.
-	RunCommandFailures int    `json:"run_command_failures,omitempty"`
-	ExitCode           int    `json:"exit_code"`
-	Error              *Error `json:"error,omitempty"`
+	RunCommandFailures int `json:"run_command_failures,omitempty"`
+	// NetLog is the absolute path to the net-access.jsonl stream that recorded
+	// every HTTP(S) connection this run made (sandbox mode only; see README
+	// "サンドボックス" / --sandbox).
+	NetLog   string `json:"net_log,omitempty"`
+	ExitCode int    `json:"exit_code"`
+	Error    *Error `json:"error,omitempty"`
 }
 
 // Error is the structured failure detail embedded in Result.Error (nil on

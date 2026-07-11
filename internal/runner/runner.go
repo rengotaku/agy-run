@@ -23,6 +23,7 @@ import (
 	"github.com/rengotaku/agy-run/internal/index"
 	"github.com/rengotaku/agy-run/internal/ratelimit"
 	"github.com/rengotaku/agy-run/internal/runcmd"
+	"github.com/rengotaku/agy-run/internal/sandbox"
 	"github.com/rengotaku/agy-run/internal/slot"
 	"github.com/rengotaku/agy-run/internal/watchdog"
 	"github.com/rengotaku/agy-run/internal/workspace"
@@ -76,6 +77,18 @@ func Run(cfg config.Config, opt Options) int {
 					return config.ExitUsage
 				}
 			}
+		}
+	}
+
+	// Guard 0.5: sandbox mode needs bwrap; fail fast (before spending a slot or
+	// the cooldown wait) instead of silently falling back to an unsandboxed run.
+	if cfg.Sandbox {
+		if _, err := exec.LookPath("bwrap"); err != nil {
+			e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+				Reason: "bwrap_not_found", Detail: err.Error(),
+				Hint: "--sandbox / AGY_RUN_SANDBOX=1 には bwrap (bubblewrap) のインストールが必要です。",
+			}})
+			return config.ExitUsage
 		}
 	}
 
@@ -210,9 +223,52 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	agyArgv := append(args, "-p", cfg.Prompt)
+	binPath := paths.AgyBin
+	spawnArgv := agyArgv
+
+	// Sandbox mode (--sandbox / AGY_RUN_SANDBOX=1): run agy under bwrap and log
+	// every HTTP(S) connection it makes (never blocking/filtering — see
+	// internal/sandbox and README). Disabled by default, so the unsandboxed
+	// path below is byte-for-byte unchanged.
+	var netLogPath string
+	if cfg.Sandbox {
+		netLogPath = filepath.Join(paths.LogDir, "net-access.jsonl")
+		logW, ferr := sandbox.OpenLogFile(netLogPath)
+		if ferr != nil {
+			_ = bodyCap.Close()
+			return errResult("sandbox_netlog_open_failed", ferr), config.ExitUsage, logFile
+		}
+		defer func() { _ = logW.Close() }()
+
+		runID := fmt.Sprintf("%s-%d", start.Format("20060102_150405"), os.Getpid())
+		proxy := sandbox.NewProxy(runID, logW)
+		addr, perr := proxy.Start()
+		if perr != nil {
+			_ = bodyCap.Close()
+			return errResult("sandbox_proxy_start_failed", perr), config.ExitUsage, logFile
+		}
+		defer func() { _ = proxy.Stop() }()
+
+		// Guard 0.5 in Run() already confirmed bwrap exists; look it up again
+		// here to get its resolved path (cheap, avoids threading it through).
+		bwrapBin, lerr := exec.LookPath("bwrap")
+		if lerr != nil {
+			_ = bodyCap.Close()
+			return errResult("bwrap_not_found", lerr), config.ExitUsage, logFile
+		}
+
+		sbOpt := sandboxOptions(opt, effectiveWorkDir(cfg), "http://"+addr)
+		bwrapArgs := sandbox.BuildArgs(sbOpt)
+
+		binPath = bwrapBin
+		spawnArgv = append(append([]string{}, bwrapArgs...), "--", paths.AgyBin)
+		spawnArgv = append(spawnArgv, agyArgv...)
+	}
+
 	// agy's stdout is captured (not forwarded live): the raw body is folded into
 	// the final JSON result, so nothing but that one object reaches our stdout.
-	cmd := commandContext(runCtx, paths.AgyBin, append(args, "-p", cfg.Prompt))
+	cmd := commandContext(runCtx, binPath, spawnArgv)
 	cmd.Stdin = devnull
 	cmd.Stdout = bodyCap
 	cmd.Stderr = opt.Stderr
@@ -277,6 +333,9 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	}
 	if convID != "" {
 		r.ConversationID = convID
+	}
+	if netLogPath != "" {
+		r.NetLog = netLogPath
 	}
 
 	// Stall / absolute-timeout branches: log tail to stderr, error in the result.
