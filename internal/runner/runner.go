@@ -47,6 +47,14 @@ func Run(cfg config.Config, opt Options) int {
 	e := emit.New(opt.Stdout, opt.Stderr)
 	paths := DefaultPaths(opt.Home, opt.Getenv)
 
+	// Detach FIRST, before any real work: move agy-run into its own process
+	// group so a launcher-group teardown (Claude's background Bash killed with
+	// `kill -- -<pgid>`) no longer cuts the delegation down mid-flight. agy-run
+	// still reaps agy on a signal to itself (watchdog / explicit kill), so the
+	// #7/#8 orphan fix stays intact (issue #9). Silent: the clean-success stderr
+	// contract stays empty.
+	detachFromLauncher()
+
 	// Ensure the state dir exists so the slot lock files can be created even on
 	// a fresh machine (agy normally creates it, but do not depend on that).
 	_ = os.MkdirAll(paths.StateDir, 0o755)
