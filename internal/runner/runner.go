@@ -324,6 +324,8 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		CWD:             effectiveWorkDir(cfg),
 		Prompt:          cfg.Prompt,
 		Artifacts:       []string{},
+		Sandbox:         cfg.Sandbox,
+		NetLog:          netLogPath,
 	}
 
 	// Assemble the single result object shared by every exit path.
