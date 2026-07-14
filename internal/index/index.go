@@ -28,6 +28,14 @@ type Record struct {
 	Prompt          string   `json:"prompt"`
 	ExitCode        int      `json:"exit_code"`
 	Artifacts       []string `json:"artifacts"`
+	// Sandbox records whether this run executed under bwrap (--sandbox /
+	// AGY_RUN_SANDBOX=1). Emitted unconditionally (no omitempty) so a false
+	// value explicitly marks an un-sandboxed run rather than being
+	// indistinguishable from a pre-#13 record that lacked the field.
+	Sandbox bool `json:"sandbox"`
+	// NetLog is the absolute path of the net-access.jsonl this run appended to;
+	// present only in sandbox mode (empty/omitted otherwise).
+	NetLog string `json:"net_log,omitempty"`
 }
 
 // Append marshals rec and appends it as one line to path. The parent dir is

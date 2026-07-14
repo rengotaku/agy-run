@@ -71,6 +71,43 @@ func TestAppendPerms600(t *testing.T) {
 	}
 }
 
+func TestAppendSandboxFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index.jsonl")
+	// Sandboxed run: sandbox=true and net_log present.
+	Append(path, Record{Prompt: "sb", Sandbox: true, NetLog: "/x/net-access.jsonl"})
+	// Un-sandboxed run: sandbox=false emitted, net_log omitted.
+	Append(path, Record{Prompt: "plain"})
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nl := indexOfNL(data)
+	var sb, plain map[string]any
+	if err := json.Unmarshal(data[:nl], &sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data[nl+1:len(data)-1], &plain); err != nil {
+		t.Fatal(err)
+	}
+
+	if sb["sandbox"] != true {
+		t.Errorf("sandboxed run: sandbox = %v, want true", sb["sandbox"])
+	}
+	if sb["net_log"] != "/x/net-access.jsonl" {
+		t.Errorf("sandboxed run: net_log = %v", sb["net_log"])
+	}
+	// false must still be emitted (no omitempty) so it is distinguishable from
+	// a pre-#13 record that lacked the field entirely.
+	if v, ok := plain["sandbox"]; !ok || v != false {
+		t.Errorf("plain run: sandbox = %v (ok=%v), want false present", v, ok)
+	}
+	if _, ok := plain["net_log"]; ok {
+		t.Errorf("plain run: net_log should be omitted, got %v", plain["net_log"])
+	}
+}
+
 func indexOfNL(b []byte) int {
 	for i, c := range b {
 		if c == '\n' {
