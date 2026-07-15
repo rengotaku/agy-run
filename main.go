@@ -57,6 +57,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
         --no-sandbox または AGY_RUN_SANDBOX=0 で無効化（優先順位: フラグ > env > 既定ON）。
         bwrap 未導入の環境では警告を1件 result.warnings に載せた上で非サンドボックスへ
         自動的に降格して実行する（exit 2 では失敗させない。詳細は README）。
+        host の GH_TOKEN（無ければ GITHUB_TOKEN）はサンドボックス内へ再注入され、
+        gh/git の GitHub 認証に使える（~/.config/gh は bind しない）。
     -h  このヘルプを表示
 
 注意（agy の書き込み先）:

@@ -274,6 +274,22 @@ func TestBuildArgsBinLibSymlinkOrRoBind(t *testing.T) {
 	}
 }
 
+func TestBuildArgsGHTokenSetenv(t *testing.T) {
+	got := BuildArgs(Options{Home: t.TempDir(), GHToken: "ghp_TESTDUMMY"})
+	if !containsSeq(got, []string{"--setenv", "GH_TOKEN", "ghp_TESTDUMMY"}) {
+		t.Errorf("expected --setenv GH_TOKEN ghp_TESTDUMMY\nargs: %v", got)
+	}
+}
+
+func TestBuildArgsGHTokenEmptyOmitsSetenv(t *testing.T) {
+	got := BuildArgs(Options{Home: t.TempDir()})
+	for i, s := range got {
+		if s == "GH_TOKEN" {
+			t.Fatalf("GH_TOKEN should not appear when GHToken is empty: %v (index %d)", got, i)
+		}
+	}
+}
+
 func TestBuildArgsEmptyOptionsProducesNoHomeOrCwdBinds(t *testing.T) {
 	got := BuildArgs(Options{})
 	joined := strings.Join(got, " ")
