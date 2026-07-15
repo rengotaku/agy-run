@@ -201,7 +201,7 @@ func TestParseSandboxEnv(t *testing.T) {
 		"true":  true,
 		"TRUE":  true,
 		"yes":   true,
-		"":      false,
+		"":      true, // unset (empty) falls back to the default (ON), not env-off
 		"0":     false,
 		"false": false,
 		"FALSE": false,
@@ -217,13 +217,53 @@ func TestParseSandboxEnv(t *testing.T) {
 	}
 }
 
-func TestParseSandboxDefaultOff(t *testing.T) {
+func TestParseSandboxDefaultOn(t *testing.T) {
 	cfg, _, err := Parse([]string{"do"}, mapEnv(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !cfg.Sandbox {
+		t.Error("sandbox should default to true")
+	}
+}
+
+func TestParseNoSandboxFlag(t *testing.T) {
+	cfg, _, err := Parse([]string{"--no-sandbox", "do"}, mapEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.Sandbox {
-		t.Error("sandbox should default to false")
+		t.Error("sandbox should be false after --no-sandbox")
+	}
+}
+
+func TestParseSandboxEnvUnsetDefaultsOn(t *testing.T) {
+	cfg, _, err := Parse([]string{"do"}, mapEnv(map[string]string{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Sandbox {
+		t.Error("sandbox should default to true when AGY_RUN_SANDBOX is unset")
+	}
+}
+
+// TestParseSandboxPrecedenceFlagOverEnv (issue #15): an explicit flag always
+// wins over AGY_RUN_SANDBOX, in either direction.
+func TestParseSandboxPrecedenceFlagOverEnv(t *testing.T) {
+	cfg, _, err := Parse([]string{"--no-sandbox", "do"}, mapEnv(map[string]string{"AGY_RUN_SANDBOX": "1"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Sandbox {
+		t.Error("--no-sandbox should win over AGY_RUN_SANDBOX=1")
+	}
+
+	cfg, _, err = Parse([]string{"--sandbox", "do"}, mapEnv(map[string]string{"AGY_RUN_SANDBOX": "0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Sandbox {
+		t.Error("--sandbox should win over AGY_RUN_SANDBOX=0")
 	}
 }
 

@@ -45,21 +45,28 @@ agy は起動 cwd を無視し、`trustedWorkspaces`（`~/.gemini/antigravity-cl
 - 委譲実務では、実装後に `main/` の該当差分を目的の worktree へ手移送する
   （`git -C main diff -- <files>` → `git -C main restore -- <files>` → `git -C <wt> apply <patch>`）。
 
-## サンドボックス (`--sandbox`)
+## サンドボックス (`--sandbox` / `--no-sandbox`)
 
-`--sandbox`（または `AGY_RUN_SANDBOX=1`）を付けると、agy を [bwrap](https://github.com/containers/bubblewrap)
-でファイルシステム隔離した中で実行し、実行中の **全 HTTP(S) 通信** を単一の JSONL ストリームへ記録する。
-通信の allowlist / 遮断は一切行わない（記録専用）。無効時（既定）は挙動が一切変わらない。
+sandbox は **既定 ON**。agy を [bwrap](https://github.com/containers/bubblewrap) でファイルシステム
+隔離した中で実行し、実行中の **全 HTTP(S) 通信** を単一の JSONL ストリームへ記録する。
+通信の allowlist / 遮断は一切行わない（記録専用）。
+
+opt-out は `--no-sandbox` または `AGY_RUN_SANDBOX=0`（`false` も可）。優先順位は
+**フラグ（`--sandbox`/`--no-sandbox`） > `AGY_RUN_SANDBOX` env > 既定(ON)**。
 
 ```bash
-agy-run --sandbox "issue #42 を実装して"
-AGY_RUN_SANDBOX=1 agy-run -W ~/code/myrepo/main -d "調査してほしい内容..."
+agy-run "issue #42 を実装して"                       # 既定でサンドボックス実行
+agy-run --no-sandbox "軽い質問"                       # 明示的に無効化
+AGY_RUN_SANDBOX=0 agy-run -W ~/code/myrepo/main -d "調査してほしい内容..."
 ```
 
 - **記録先**: `~/.gemini/antigravity-cli/log/net-access.jsonl`（全 run・全並列スロットが同一ファイルに追記。ローテーションなし）
 - **記録内容**: 1接続=1行の JSON（`ts` / `run_id` / `method` / `host` / `port` / `bytes_up` / `bytes_down` / `duration_s`。ダイアル失敗時は `error` も付く）
-- **結果 JSON**: `--sandbox` 実行時のみ `net_log` にログファイルの絶対パスが入る
-- **bwrap 未導入**: 実行前に `exit 2`（`error.reason: "bwrap_not_found"`）。フォールバック実行はしない
+- **結果 JSON**: サンドボックス実行時のみ `net_log` にログファイルの絶対パスが入る
+- **bwrap 未導入**: ハード失敗（`exit 2`）にはしない。警告を1件 `result.warnings` に載せた上で、
+  そのrunに限り非サンドボックス（FS隔離・通信記録なし）へ自動的に降格して実行する。降格した run は
+  `index.jsonl` にも `sandbox:false`・`net_log` 省略で正直に記録される。bubblewrap を入れると次回以降
+  サンドボックス（隔離＋記録）が有効になる。
 
 ### bind 一覧（最小構成、issue #11 の PoC を踏襲）
 

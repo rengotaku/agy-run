@@ -80,18 +80,6 @@ func Run(cfg config.Config, opt Options) int {
 		}
 	}
 
-	// Guard 0.5: sandbox mode needs bwrap; fail fast (before spending a slot or
-	// the cooldown wait) instead of silently falling back to an unsandboxed run.
-	if cfg.Sandbox {
-		if _, err := exec.LookPath("bwrap"); err != nil {
-			e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
-				Reason: "bwrap_not_found", Detail: err.Error(),
-				Hint: "--sandbox / AGY_RUN_SANDBOX=1 には bwrap (bubblewrap) のインストールが必要です。",
-			}})
-			return config.ExitUsage
-		}
-	}
-
 	// Guard 1: cooldown after a prior kill (avoids the exit-144 instant death).
 	cooldown(e, paths.KillStamp)
 
@@ -227,11 +215,20 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	binPath := paths.AgyBin
 	spawnArgv := agyArgv
 
-	// Sandbox mode (--sandbox / AGY_RUN_SANDBOX=1): run agy under bwrap and log
-	// every HTTP(S) connection it makes (never blocking/filtering — see
-	// internal/sandbox and README). Disabled by default, so the unsandboxed
-	// path below is byte-for-byte unchanged.
+	// Sandbox mode (default ON; --no-sandbox / AGY_RUN_SANDBOX=0 to opt out):
+	// run agy under bwrap and log every HTTP(S) connection it makes (never
+	// blocking/filtering — see internal/sandbox and README). When bwrap is not
+	// on PATH, degrade to a plain (unsandboxed) run rather than hard-failing —
+	// this must never block a run, so the caller sees a warning instead of an
+	// error (issue #15).
 	var netLogPath string
+	var sandboxWarn string
+	if cfg.Sandbox {
+		if _, err := exec.LookPath("bwrap"); err != nil {
+			sandboxWarn = "bwrap (bubblewrap) が未導入のため、このrunは非サンドボックスで実行しました（FS隔離・通信記録なし）。bubblewrap を入れると --sandbox の隔離＋記録が有効になります。"
+			cfg.Sandbox = false
+		}
+	}
 	if cfg.Sandbox {
 		netLogPath = filepath.Join(paths.LogDir, "net-access.jsonl")
 		logW, ferr := sandbox.OpenLogFile(netLogPath)
@@ -250,8 +247,9 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		}
 		defer func() { _ = proxy.Stop() }()
 
-		// Guard 0.5 in Run() already confirmed bwrap exists; look it up again
-		// here to get its resolved path (cheap, avoids threading it through).
+		// The availability check above already confirmed bwrap exists; look it
+		// up again here to get its resolved path (cheap, avoids threading it
+		// through).
 		bwrapBin, lerr := exec.LookPath("bwrap")
 		if lerr != nil {
 			_ = bodyCap.Close()
@@ -330,6 +328,9 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 
 	// Assemble the single result object shared by every exit path.
 	r := emit.Result{Body: body}
+	if sandboxWarn != "" {
+		r.Warnings = append(r.Warnings, sandboxWarn)
+	}
 	if model != "" {
 		r.Model = model
 	}
