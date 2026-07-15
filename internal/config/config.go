@@ -42,7 +42,7 @@ type Config struct {
 	ExtraArgs    []string // -a (repeatable)
 	Workspace    string   // -W / --workspace (agy cmd.Dir; "" keeps caller cwd)
 	WaitQuota    bool     // --wait-quota (parse "Resets in" and wait once, bounded)
-	Sandbox      bool     // --sandbox / AGY_RUN_SANDBOX (bwrap isolation + net logging)
+	Sandbox      bool     // 既定 ON。--no-sandbox / AGY_RUN_SANDBOX=0 で無効化（bwrap isolation + net logging）
 	Prompt       string   // joined trailing args
 
 	MaxConcurrency int // AGY_RUN_MAX_CONCURRENCY (>=1)
@@ -64,12 +64,14 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 	cfg = Config{
 		PrintTimeout: DefaultPrintTimeout,
 		LockWait:     DefaultLockWait,
+		Sandbox:      true,
 	}
 
 	opts, rest, err := getopts(argv, "t:m:cC:w:W:da:h", longOpts)
 	if err != nil {
 		return cfg, false, err
 	}
+	var sandboxFlagSet bool
 	for _, o := range opts {
 		switch o.name {
 		case 't':
@@ -96,6 +98,10 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 			cfg.WaitQuota = true
 		case 'S': // internal short byte for --sandbox
 			cfg.Sandbox = true
+			sandboxFlagSet = true
+		case 'N': // internal short byte for --no-sandbox
+			cfg.Sandbox = false
+			sandboxFlagSet = true
 		case 'h':
 			return cfg, true, nil
 		}
@@ -119,23 +125,27 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 	}
 	cfg.MaxQuotaWait = envInt(env, "AGY_RUN_MAX_QUOTA_WAIT", DefaultMaxQuotaWait)
 
-	// AGY_RUN_SANDBOX=1 (or any non-empty value other than "0"/"false") enables
-	// sandbox mode the same as --sandbox; either is sufficient.
-	if envBool(env, "AGY_RUN_SANDBOX") {
-		cfg.Sandbox = true
+	// Sandbox precedence: flag (--sandbox/--no-sandbox) > AGY_RUN_SANDBOX env >
+	// default (ON). AGY_RUN_SANDBOX=0/false disables, 1/true (or any other
+	// non-empty value) enables; it is only consulted when no flag was given.
+	if !sandboxFlagSet {
+		if v := strings.TrimSpace(env("AGY_RUN_SANDBOX")); v != "" {
+			cfg.Sandbox = envBool(env, "AGY_RUN_SANDBOX")
+		}
 	}
 
 	return cfg, false, nil
 }
 
 // longOpts folds agy-run's long flags onto the internal short bytes Parse
-// dispatches on. --wait-quota and --sandbox have no short form, so they use
-// the private bytes 'Q' and 'S'.
+// dispatches on. --wait-quota, --sandbox and --no-sandbox have no short form,
+// so they use the private bytes 'Q', 'S' and 'N'.
 var longOpts = map[string]longOpt{
 	"workspace":  {short: 'W', takesArg: true},
 	"model":      {short: 'm', takesArg: true},
 	"wait-quota": {short: 'Q', takesArg: false},
 	"sandbox":    {short: 'S', takesArg: false},
+	"no-sandbox": {short: 'N', takesArg: false},
 }
 
 // Continued reports whether this call continues an existing conversation.

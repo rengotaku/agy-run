@@ -76,7 +76,10 @@ func TestAttemptCancelReapsGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, _, err := config.Parse([]string{"hang please"}, os.Getenv)
+	// --no-sandbox: this test asserts process-group reaping semantics, not
+	// sandbox behaviour, and must not depend on bwrap being present/usable in
+	// the test environment (sandbox now defaults to ON — issue #15).
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "hang please"}, os.Getenv)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -128,7 +131,9 @@ func TestSIGTERMReapsAgyGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(bin, "hang please")
+	// --no-sandbox: this test asserts process-group reaping semantics, not
+	// sandbox behaviour (sandbox now defaults to ON — issue #15).
+	cmd := exec.Command(bin, "--no-sandbox", "hang please")
 	cmd.Env = append(os.Environ(),
 		"HOME="+home,
 		"XDG_DATA_HOME="+filepath.Join(home, "data"))
@@ -191,7 +196,9 @@ func TestDetachSurvivesLauncherGroupTeardown(t *testing.T) {
 
 	// The launcher: a shell that starts agy-run as a background child in ITS OWN
 	// process group (no per-child setpgid), mirroring Claude's background Bash.
-	script := bin + " hang please & echo $! > " + agyrunPidFile + "\nwait\n"
+	// --no-sandbox: this test asserts detach/reap semantics, not sandbox
+	// behaviour (sandbox now defaults to ON — issue #15).
+	script := bin + " --no-sandbox hang please & echo $! > " + agyrunPidFile + "\nwait\n"
 	launcher := exec.Command("sh", "-c", script)
 	launcher.Env = append(os.Environ(),
 		"HOME="+home,

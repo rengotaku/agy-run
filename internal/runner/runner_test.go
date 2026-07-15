@@ -86,9 +86,17 @@ func newHome(t *testing.T) string {
 	return home
 }
 
+// run wraps config.Parse + Run for the test suite. Sandbox now defaults to ON
+// (issue #15), but most of these tests exercise unrelated behaviour (model
+// fallback, watchdog, RUN_COMMAND audit, ...) and must not depend on bwrap /
+// D-Bus being available in the test environment. So the helper prepends
+// "--no-sandbox" to every call; the handful of sandbox-specific tests below
+// override it by passing an explicit "--sandbox" later in argv (the later
+// flag occurrence wins — see config.Parse's option loop).
 func run(t *testing.T, home string, argv []string) (int, string, string) {
 	t.Helper()
-	cfg, _, err := config.Parse(argv, os.Getenv)
+	full := append([]string{"--no-sandbox"}, argv...)
+	cfg, _, err := config.Parse(full, os.Getenv)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -421,27 +429,56 @@ func TestRunWorkspacePreflightWarns(t *testing.T) {
 	}
 }
 
-// TestRunSandboxRequiresBwrap (issue #11): --sandbox without bwrap on PATH
-// must fail fast, before touching the slot/cooldown machinery, with a clear
-// error — never silently falling back to an unsandboxed run.
-func TestRunSandboxRequiresBwrap(t *testing.T) {
+// TestRunSandboxDegradesWithoutBwrap (issue #15): sandbox requested (default
+// ON, or explicit --sandbox) but bwrap is not on PATH must NOT hard-fail —
+// it degrades to a plain (unsandboxed) run, surfaces exactly one warning
+// mentioning bwrap, and still returns the agy body/exit code normally.
+//
+// bwrap availability is environment-dependent (the dev/CI box may or may not
+// have it installed), so this test does not rely on the ambient PATH: it
+// points PATH at a directory containing only the agy stub (no bwrap), which
+// makes exec.LookPath("bwrap") fail deterministically regardless of the host.
+func TestRunSandboxDegradesWithoutBwrap(t *testing.T) {
 	home := newHome(t)
-	t.Setenv("STUB_BODY", "should not run")
-	t.Setenv("PATH", home) // no bwrap anywhere on this PATH
+	t.Setenv("STUB_BODY", "hello despite no bwrap")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("PATH", filepath.Join(home, ".local", "bin")) // agy stub only, no bwrap
 
 	rc, out, _ := run(t, home, []string{"--sandbox", "hi"})
-	if rc != config.ExitUsage {
-		t.Fatalf("rc = %d, want 2 (usage)", rc)
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0 (degrade, not a hard failure)", rc)
 	}
 	r := parseResult(t, out)
-	if r.Error == nil || r.Error.Reason != "bwrap_not_found" {
-		t.Fatalf("expected bwrap_not_found error, got %+v", r)
+	if r.Error != nil {
+		t.Fatalf("bwrap-missing degrade must not produce an error, got %+v", r.Error)
+	}
+	if !strings.Contains(r.Body, "hello despite no bwrap") {
+		t.Errorf("body = %q, want the degraded run to still complete", r.Body)
+	}
+	if len(r.Warnings) != 1 || !strings.Contains(r.Warnings[0], "bwrap") {
+		t.Fatalf("expected exactly one bwrap warning, got %v", r.Warnings)
+	}
+	if r.NetLog != "" {
+		t.Errorf("net_log = %q, want empty on degrade", r.NetLog)
+	}
+
+	// index.jsonl must record the degrade honestly: sandbox:false, no net_log.
+	idx := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if !strings.Contains(string(data), `"sandbox":false`) {
+		t.Errorf("index record should show sandbox:false on degrade, got %s", data)
+	}
+	if strings.Contains(string(data), "net_log") {
+		t.Errorf("index record should omit net_log on degrade, got %s", data)
 	}
 }
 
-// TestRunWithoutSandboxHasNoNetLogField: the default (non-sandbox) path must
-// stay byte-for-byte unchanged — result.net_log is only ever set when
-// --sandbox/AGY_RUN_SANDBOX actually ran the attempt under bwrap.
+// TestRunWithoutSandboxHasNoNetLogField: with sandbox explicitly disabled
+// (--no-sandbox, as the run() test helper defaults to), result.net_log stays
+// unset — it is only ever populated when an attempt actually ran under bwrap.
 func TestRunWithoutSandboxHasNoNetLogField(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "hello")
@@ -452,7 +489,7 @@ func TestRunWithoutSandboxHasNoNetLogField(t *testing.T) {
 	}
 	r := parseResult(t, out)
 	if r.NetLog != "" {
-		t.Errorf("net_log = %q, want empty when --sandbox is not set", r.NetLog)
+		t.Errorf("net_log = %q, want empty when sandbox is disabled", r.NetLog)
 	}
 	if strings.Contains(out, "net_log") {
 		t.Errorf("stdout JSON should omit net_log entirely, got: %s", out)
