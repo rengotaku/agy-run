@@ -84,6 +84,10 @@ dotfiles がどこにあっても `EvalSymlinks` で追従する）。
 追加の bind が要るときは `AGY_RUN_SANDBOX_RO_BINDS` / `AGY_RUN_SANDBOX_RW_BINDS`（コロン区切り、
 存在しないパスは黙ってスキップ）で指定する。
 
+host の `GH_TOKEN`（無ければ `GITHUB_TOKEN`）があればサンドボックス内へ `--setenv GH_TOKEN` で
+注入するので、サンドボックス内の `gh` / `git` の GitHub 認証が通る。`~/.config/gh`（human の
+OAuth admin トークン）は bind しない。scoped PAT（`GH_TOKEN`）のみを注入する方針。
+
 ### 記録の制限
 
 - **プロキシ env を無視する通信は記録に載らない**（生 UDP・QUIC・env を読まないプロセス等）。

@@ -24,6 +24,7 @@ type Options struct {
 	DBusAddress   string // DBUS_SESSION_BUS_ADDRESS ("" = not forwarded/bound)
 	PathEnv       string // PATH to forward (--setenv PATH)
 	ProxyAddr     string // "http://127.0.0.1:<port>" — set on all 4 proxy env vars
+	GHToken       string // GH_TOKEN to re-export inside the sandbox for gh/git GitHub auth ("" = not forwarded)
 	ExtraROBinds  []string
 	ExtraRWBinds  []string
 }
@@ -43,6 +44,7 @@ type Options struct {
 //	--clearenv --setenv HOME/PATH/XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS
 //	--setenv HTTPS_PROXY/HTTP_PROXY/https_proxy/http_proxy <ProxyAddr>
 //	--setenv TERM dumb
+//	--setenv GH_TOKEN <GHToken>  (gh/git GitHub 認証用。空なら渡さない)
 func BuildArgs(opt Options) []string {
 	var a []string
 	add := func(s ...string) { a = append(a, s...) }
@@ -128,6 +130,7 @@ func BuildArgs(opt Options) []string {
 	setenv("https_proxy", opt.ProxyAddr)
 	setenv("http_proxy", opt.ProxyAddr)
 	setenv("TERM", "dumb")
+	setenv("GH_TOKEN", opt.GHToken)
 
 	return a
 }
