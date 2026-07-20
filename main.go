@@ -94,6 +94,12 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
                              フラグ未指定時のみ参照（既定は ON）
     AGY_RUN_SANDBOX_RO_BINDS 追加の読み取り専用 bind（コロン区切り、存在しないパスは無視）
     AGY_RUN_SANDBOX_RW_BINDS 追加の書き込み可 bind（コロン区切り、存在しないパスは無視）
+    AGY_RUN_SANDBOX_NO_DBUS  1/true/yes/on で D-Bus セッションソケットを sandbox に bind
+                             しない。issue #19 の systemd-run --user 経由の escape 経路
+                             （-d 実行時にモデルがサンドボックス外へコマンドを飛ばせる）
+                             を塞ぐ。既定は bind する（agy の OAuth トークンが Secret
+                             Service にあると "Authentication required" で落ちるため。
+                             issue #11）。Secret Service に依存しない環境で有効化推奨
 
 出力（stdout = JSON 1個。stderr は cooldown 通知や stall/timeout のログ末尾など人向けのみ）:
     {

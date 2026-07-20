@@ -95,6 +95,11 @@ OAuth admin トークン）は bind しない。scoped PAT（`GH_TOKEN`）のみ
   `--unshare-net` + パケットキャプチャ方式への発展が別途必要（本実装は不採用）。
 - **D-Bus セッションバスを bind するため、サンドボックス内から D-Bus 経由のホスト操作が可能**
   （隔離の穴）。将来的に `xdg-dbus-proxy --filter` で `org.freedesktop.secrets` のみへ絞れる。
+  当面の緩和策として、`AGY_RUN_SANDBOX_NO_DBUS=1`（1/true/yes/on）を付けると D-Bus セッション
+  ソケットを bind しない。issue #19（`-d` 実行時のモデルによる `systemd-run --user` escape）を
+  塞ぐが、Secret Service に OAuth トークンがある agy 実行は `Authentication required` で落ちる
+  トレードオフがある（issue #11）。Secret Service に依存しない環境（トークンが `~/.gemini` 直下に
+  平文で保存されている等）で opt-in する。
 
 ## ビルド
 
