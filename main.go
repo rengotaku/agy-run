@@ -34,13 +34,13 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
 フラグ:
     -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）。
         ※ agy 自身へ渡すだけ。外側の総枠は下記 idle/abs watchdog が別に効く
-    -m  モデル名。"agy models" の文字列と完全一致必須（バージョン・大文字小文字・括弧まで）。
+    -m  モデル名。"agy models" の文字列と完全一致必須（kebab-case ID、"-" の位置まで）。
         記憶で書かず迷ったら "agy models" を実行して正確な名前を取る。
         不一致は実行前に exit 2 で弾き、error.available_models[] に候補を返す
         （サイレントに別モデルで走ることはない）。未指定なら agy 既定モデル（--model も可）。
         カンマ区切りでフォールバック候補を並べると、rate_limited 時に順に再試行し、
         実際に使ったモデルを result.model に返す。
-        例: "Gemini 3.5 Flash (High)" / "Gemini 3.1 Pro (High)"
+        例: "gemini-3.6-flash-high" / "gemini-3.1-pro-high"
     -c  直近会話の継続
     -C  会話ID (<conversation-id>) を指定して継続（前回結果 JSON の conversation_id）
     -w  スロットロック待ち秒数（既定 240）。空きスロットを取れなければ exit 4
@@ -117,7 +117,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     例: agy-run "質問" 2>/dev/null | jq -r .body             # 本文だけ取り出す
         agy-run "質問" 2>/dev/null | jq -r .conversation_id  # 継続用 ID を取る
         agy-run -C <id> "続きの質問"                          # 同じ会話に追撃
-        agy-run -m "Gemini 3.5 Flash (High)" -t 120s "軽い質問"
+        agy-run -m "gemini-3.6-flash-high" -t 120s "軽い質問"
         agy-run "質問" 2>/dev/null | jq -r '.artifacts[]'    # 生成画像のパス列挙
         agy-run "質問" 2>/dev/null | jq -r '.warnings[]?'    # 警告を列挙
 
