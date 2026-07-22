@@ -72,7 +72,7 @@ func Run(cfg config.Config, opt Options) int {
 						Reason:          "unknown_model",
 						Detail:          m,
 						AvailableModels: models,
-						Hint:            `-m は agy models の名称と完全一致が必要（例: "Gemini 3.5 Flash (High)"）。カンマ区切りでフォールバック候補を並べられます。`,
+						Hint:            `-m は agy models の名称と完全一致が必要（kebab-case ID。例: "gemini-3.6-flash-high"）。カンマ区切りでフォールバック候補を並べられます。`,
 					}})
 					return config.ExitUsage
 				}

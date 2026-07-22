@@ -22,14 +22,14 @@
 
 ```bash
 agy-run "調査してほしい内容..."
-agy-run -m "Gemini 3.5 Flash (High)" -t 120s "軽い質問"
+agy-run -m "gemini-3.6-flash-high" -t 120s "軽い質問"
 agy-run -C <conversation-id> "続きの質問"       # 会話継続
 agy-run "質問" 2>/dev/null | jq -r .body        # 本文だけ取り出す
 
 # 実装委譲: 対象リポの main worktree を -W で渡し、フォールバック候補も並べる
-agy-run -W ~/code/myrepo -m "Gemini 3.1 Pro (High),Gemini 3.5 Flash (High)" \
+agy-run -W ~/code/myrepo -m "gemini-3.1-pro-high,gemini-3.6-flash-high" \
         -d "issue #42 を実装して"
-agy-run --wait-quota -m "Gemini 3.1 Pro (High)" "quota 復帰を待って続行"
+agy-run --wait-quota -m "gemini-3.1-pro-high" "quota 復帰を待って続行"
 ```
 
 詳細なフラグ・環境変数・exit code は `agy-run -h` を参照。
