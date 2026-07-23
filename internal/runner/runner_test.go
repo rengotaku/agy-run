@@ -217,6 +217,125 @@ func TestRunRateLimited(t *testing.T) {
 	}
 }
 
+// T8 (issue #22 follow-up): agy's OTHER quota shape — exit 1 (not the
+// clean-exit-0 the original rate-limit detection assumed) with an empty body
+// and a quota/rate-limit signature in the log (e.g. "Individual quota
+// reached ... Resets in 37m2s"). Real-world runs showed this was the
+// dominant shape behind the exit-1 spike, and previously left error.reason
+// unset entirely (exit code never normalized to 42, so the -m fallback chain
+// and --wait-quota never fired on it). Per the coordinator's brief, the
+// "next candidate gets tried" chain assertion is intentionally not
+// re-verified here — TestRunModelFallback already covers that once rc==42,
+// the model retries; this test's job is confirming rc gets normalized to 42
+// from this exit-1 shape in the first place.
+func TestRunQuotaExit1NormalizesToRateLimited(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "1")
+	t.Setenv("STUB_LOG_EXTRA", "Error: Individual quota reached. Resets in 37m2s")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want 42 (rate_limited normalization)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("result missing rate_limited error: %+v", r)
+	}
+	if r.ExitCode != config.ExitRateLimited {
+		t.Errorf("result exit_code = %d, want 42", r.ExitCode)
+	}
+
+	idx := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if !strings.Contains(string(data), `"error_class":"rate_limited"`) {
+		t.Errorf("index record missing error_class=rate_limited, got %s", data)
+	}
+}
+
+// T9 (issue #22 follow-up): a non-zero agy exit with no rate-limit signature
+// must not be silently left unclassified — it falls back to the generic
+// "agy_error" so index.jsonl stays diagnosable, but the exit code itself is
+// left untouched (its meaning must not change).
+func TestRunOtherFailureClassifiedAsAgyError(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "1")
+	t.Setenv("STUB_LOG_EXTRA", "Error: something else went wrong")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != 1 {
+		t.Fatalf("rc = %d, want 1 (unchanged)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "agy_error" {
+		t.Errorf("result missing agy_error: %+v", r)
+	}
+	if r.ExitCode != 1 {
+		t.Errorf("result exit_code = %d, want 1", r.ExitCode)
+	}
+
+	idx := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if !strings.Contains(string(data), `"error_class":"agy_error"`) {
+		t.Errorf("index record missing error_class=agy_error, got %s", data)
+	}
+}
+
+// TestRunRateLimitedRecordsErrorClassInIndex (issue #22): a failing run's
+// index.jsonl record must carry the same error_class as the stdout result, so
+// index.jsonl stops being an undiagnosable blank for the 31% of runs that
+// exit non-zero (the motivating measurement in issue #22).
+func TestRunRateLimitedRecordsErrorClassInIndex(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, _, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want 42", rc)
+	}
+
+	idx := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if !strings.Contains(string(data), `"error_class":"rate_limited"`) {
+		t.Errorf("index record missing error_class, got %s", data)
+	}
+}
+
+// TestRunSuccessOmitsErrorClassInIndex (issue #22): a clean success must keep
+// the pre-existing index.jsonl shape — no error_class key at all — so
+// existing readers (agy-review) are unaffected.
+func TestRunSuccessOmitsErrorClassInIndex(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, _, _ := run(t, home, []string{"say hi"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+
+	idx := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idx)
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if strings.Contains(string(data), "error_class") {
+		t.Errorf("success record should omit error_class, got %s", data)
+	}
+}
+
 func TestRunEmptyOutput(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "")

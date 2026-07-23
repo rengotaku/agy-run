@@ -29,6 +29,14 @@ const (
 	DefaultPollSec        = 20    // AGY_RUN_POLL
 	CooldownSec           = 30    // post-kill cooldown
 	DefaultMaxQuotaWait   = 14400 // AGY_RUN_MAX_QUOTA_WAIT (4h cap for --wait-quota)
+
+	// DefaultIndexMaxBytes is the size (bytes) at which internal/index rotates
+	// index.jsonl into index.jsonl.1 (kept to 3 generations, oldest dropped).
+	// Read directly by internal/index via AGY_RUN_INDEX_MAX_BYTES; 0 disables
+	// rotation. Defined here (not threaded through Config) so it follows the
+	// same "AGY_RUN_* default + env name" convention as the other knobs above
+	// without forcing every Append call site to carry a Config (issue #22).
+	DefaultIndexMaxBytes = 10 * 1024 * 1024 // AGY_RUN_INDEX_MAX_BYTES
 )
 
 // Config is the fully-resolved invocation.
