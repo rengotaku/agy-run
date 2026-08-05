@@ -16,6 +16,13 @@ import (
 // gh/git GitHub auth works inside the sandbox (issue #17); it stays "" (not
 // forwarded) when neither is set.
 //
+// The resolved token value is returned separately from sandbox.Options (never
+// as a field on it — issue #25): sandbox.Options only ever carries a
+// GHTokenFD (an fd number, set by the caller once it has piped the value in),
+// so the sandbox package itself is structurally unable to place the token's
+// value in bwrap's argv. The caller (attempt(), in runner.go) is responsible
+// for turning the returned string into a pipe and wiring GHTokenFD.
+//
 // AGY_RUN_SANDBOX_NO_DBUS=1 opts out of forwarding the D-Bus session socket
 // into the sandbox (issue #19). The default forwards it because agy's OAuth
 // token lives in Secret Service (gnome-keyring) and unauthenticated runs die
@@ -24,7 +31,7 @@ import (
 // exposes when -d (--dangerously-skip-permissions) is active — at the cost
 // of breaking Secret Service-backed auth. Users whose agy credentials are in
 // ~/.gemini directly (or who re-auth per session) can safely enable it.
-func sandboxOptions(opt Options, cwd, proxyAddr string) sandbox.Options {
+func sandboxOptions(opt Options, cwd, proxyAddr string) (sandbox.Options, string) {
 	getenv := opt.Getenv
 	if getenv == nil {
 		getenv = os.Getenv
@@ -48,10 +55,9 @@ func sandboxOptions(opt Options, cwd, proxyAddr string) sandbox.Options {
 		DBusAddress:   dbusAddr,
 		PathEnv:       getenv("PATH"),
 		ProxyAddr:     proxyAddr,
-		GHToken:       ghToken,
 		ExtraROBinds:  sandbox.ParseBindList(getenv("AGY_RUN_SANDBOX_RO_BINDS")),
 		ExtraRWBinds:  sandbox.ParseBindList(getenv("AGY_RUN_SANDBOX_RW_BINDS")),
-	}
+	}, ghToken
 }
 
 // envBool matches the semantics of config.envBool for a single boolean flag:

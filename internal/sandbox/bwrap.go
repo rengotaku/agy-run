@@ -6,11 +6,20 @@
 package sandbox
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// GHTokenSecretPath is the fixed destination bwrap writes the GH_TOKEN value
+// to inside the sandbox (via --perms 0600 --file, see BuildArgs) when
+// Options.GHTokenFD is set. It never appears in bwrap's own argv alongside a
+// secret value — only this fixed path and an fd *number* do — so the token
+// itself cannot leak through /proc/<pid>/cmdline (issue #25).
+const GHTokenSecretPath = "/tmp/.agy-run-gh-token"
 
 // Options are the already-resolved runtime values BuildArgs needs. Callers
 // (internal/runner) gather these from os.UserHomeDir / env / the run's cwd;
@@ -24,9 +33,17 @@ type Options struct {
 	DBusAddress   string // DBUS_SESSION_BUS_ADDRESS ("" = not forwarded/bound)
 	PathEnv       string // PATH to forward (--setenv PATH)
 	ProxyAddr     string // "http://127.0.0.1:<port>" — set on all 4 proxy env vars
-	GHToken       string // GH_TOKEN to re-export inside the sandbox for gh/git GitHub auth ("" = not forwarded)
-	ExtraROBinds  []string
-	ExtraRWBinds  []string
+	// GHTokenFD is the fd number (as seen by the child bwrap process, e.g. 3
+	// for exec.Cmd.ExtraFiles[0]) of a pipe whose contents are the GH_TOKEN
+	// value; 0 means no token is forwarded. BuildArgs never sees the token's
+	// actual value — only this fd number — so the sandbox package is
+	// structurally unable to place a secret in bwrap's argv (issue #25; see
+	// GHTokenSecretPath and WrapExecWithSecretEnv for how the value reaches
+	// GH_TOKEN inside the sandbox without ever being an argv/env of bwrap
+	// itself).
+	GHTokenFD    int
+	ExtraROBinds []string
+	ExtraRWBinds []string
 }
 
 // BuildArgs assembles the bwrap argv (everything before "-- <agy argv>") from
@@ -44,7 +61,7 @@ type Options struct {
 //	--clearenv --setenv HOME/PATH/XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS
 //	--setenv HTTPS_PROXY/HTTP_PROXY/https_proxy/http_proxy <ProxyAddr>
 //	--setenv TERM dumb
-//	--setenv GH_TOKEN <GHToken>  (gh/git GitHub 認証用。空なら渡さない)
+//	--perms 0600 --file <GHTokenFD> <GHTokenSecretPath>  (gh/git GitHub 認証用。fd無しなら渡さない)
 func BuildArgs(opt Options) []string {
 	var a []string
 	add := func(s ...string) { a = append(a, s...) }
@@ -111,6 +128,25 @@ func BuildArgs(opt Options) []string {
 		add("--bind", p, p)
 	}
 
+	if opt.GHTokenFD > 0 {
+		// Writes the pipe's contents (the GH_TOKEN value) to a fresh,
+		// mode-0600 *regular file* at GHTokenSecretPath inside the sandbox's
+		// tmpfs. Only the fd *number* and the fixed dest path ever appear
+		// here — never the token's value — so bwrap's own argv (visible via
+		// /proc/<pid>/cmdline to any same-uid process) never carries the
+		// secret (issue #25).
+		//
+		// --file (not --ro-bind-data) is required here: --ro-bind-data
+		// creates a bind mount, and `rm -f` on a bind-mount point always
+		// fails with EBUSY ("Device or resource busy") regardless of its
+		// ro/rw mode — so WrapExecWithSecretEnv's one-shot `rm -f` would
+		// silently fail (its trailing `;` swallows the error) and leave the
+		// secret file readable for the sandboxed process's whole lifetime.
+		// --file copies the fd's content into a genuine tmpfs file, which
+		// `rm -f` can remove normally.
+		add("--perms", "0600", "--file", strconv.Itoa(opt.GHTokenFD), GHTokenSecretPath)
+	}
+
 	if opt.Cwd != "" {
 		add("--chdir", opt.Cwd)
 	}
@@ -130,9 +166,28 @@ func BuildArgs(opt Options) []string {
 	setenv("https_proxy", opt.ProxyAddr)
 	setenv("http_proxy", opt.ProxyAddr)
 	setenv("TERM", "dumb")
-	setenv("GH_TOKEN", opt.GHToken)
 
 	return a
+}
+
+// WrapExecWithSecretEnv builds a "/bin/sh -c ..." argv that, once inside the
+// sandbox, reads secretPath (the regular file bwrap's --file wrote from the
+// fd pipe — see GHTokenSecretPath), exports it as envVar, deletes the
+// one-shot secret file, then exec's the original program (argv[0]) with the
+// rest of argv, passed through the shell's positional parameters ("$0" "$@")
+// so no shell-interpolation/injection of argv happens. The script text itself
+// only ever contains secretPath/envVar (fixed, non-secret strings) — never a
+// token value, since this function is never given one (issue #25).
+//
+// argv must be non-empty (argv[0] is the program to exec); an empty argv is
+// returned unchanged since there is nothing to wrap.
+func WrapExecWithSecretEnv(secretPath, envVar string, argv []string) []string {
+	if len(argv) == 0 {
+		return argv
+	}
+	script := fmt.Sprintf(`export %s="$(cat %s)"; rm -f %s; exec "$0" "$@"`, envVar, secretPath, secretPath)
+	wrapped := append([]string{"/bin/sh", "-c", script}, argv...)
+	return wrapped
 }
 
 // ParseBindList splits a colon-separated AGY_RUN_SANDBOX_RO_BINDS /

@@ -84,9 +84,32 @@ dotfiles がどこにあっても `EvalSymlinks` で追従する）。
 追加の bind が要るときは `AGY_RUN_SANDBOX_RO_BINDS` / `AGY_RUN_SANDBOX_RW_BINDS`（コロン区切り、
 存在しないパスは黙ってスキップ）で指定する。
 
-host の `GH_TOKEN`（無ければ `GITHUB_TOKEN`）があればサンドボックス内へ `--setenv GH_TOKEN` で
-注入するので、サンドボックス内の `gh` / `git` の GitHub 認証が通る。`~/.config/gh`（human の
-OAuth admin トークン）は bind しない。scoped PAT（`GH_TOKEN`）のみを注入する方針。
+host の `GH_TOKEN`（無ければ `GITHUB_TOKEN`）があれば、サンドボックス内の `gh` / `git` の
+GitHub 認証が通るよう転送する。`~/.config/gh`（human の OAuth admin トークン）は bind しない。
+scoped PAT（`GH_TOKEN`）のみを転送する方針。
+
+**転送経路（issue #25）**: トークンの実値は bwrap の起動引数（`--setenv`）には一切載せない。
+bwrap プロセスの argv は `/proc/<pid>/cmdline` として同一ユーザーの他プロセスから
+`ps auxww` / `pgrep -af bwrap` で読めてしまうため、`--setenv GH_TOKEN <値>` は事実上の平文
+漏洩経路になる。代わりに次の経路で転送する:
+
+1. agy-run が `os.Pipe()` を作り、write 側にトークン値を書き込んで close する
+2. read 側を `exec.Cmd.ExtraFiles` に積む（子プロセスから見て fd 3 になる）
+3. bwrap には `--perms 0600 --file 3 /tmp/.agy-run-gh-token` を渡す（fd の中身を mode 0600 の
+   **通常ファイル**としてサンドボックス内の tmpfs に書き込む bwrap 標準機能。bwrap の argv に
+   現れるのは fd 番号と固定パスのみで、トークンの値ではない。`--ro-bind-data` は使わない —
+   これは bind mount を作る flag で、mount point を `rm`/`unlink` すると ro/rw を問わず常に
+   `EBUSY (Device or resource busy)` になり、次の手順4の one-shot 削除が失敗するため）
+4. bwrap の `--` 以降は agy バイナリを直接 exec せず、小さな `/bin/sh -c` ラッパーを挟む:
+   `export GH_TOKEN="$(cat /tmp/.agy-run-gh-token)"; rm -f /tmp/.agy-run-gh-token; exec "$0" "$@"`
+   （`"$0" "$@"` に元の argv をそのまま positional parameter として渡すので、シェル解釈による
+   インジェクションの余地はない）
+
+GH_TOKEN が無い（未設定）場合はこのラッパーを挟まず、従来どおり agy バイナリを直接 exec する。
+なお agy プロセス自身の環境変数（`/proc/<agy-pid>/environ`）には最終的に `GH_TOKEN` が残る
+（`gh`/`git` に環境変数として渡す必要があるため）。`ps`/`pgrep -af` のような日常的な観測手段
+には載らなくなるが、同一ユーザーの別プロセスから `/proc/pid/environ` を意図的に読む行為までは
+防げない（プロセス分離・別 uid 化は別 issue のスコープ）。
 
 ### 記録の制限
 
