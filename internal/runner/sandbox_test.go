@@ -6,7 +6,7 @@ func TestSandboxOptionsXDGRuntimeDirFallback(t *testing.T) {
 	env := map[string]string{"PATH": "/usr/bin"}
 	getenv := func(k string) string { return env[k] }
 
-	opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+	opt, ghToken := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
 	if opt.XDGRuntimeDir == "" || opt.XDGRuntimeDir == "/run/user/" {
 		t.Errorf("XDGRuntimeDir fallback not set: %q", opt.XDGRuntimeDir)
 	}
@@ -16,13 +16,16 @@ func TestSandboxOptionsXDGRuntimeDirFallback(t *testing.T) {
 	if opt.PathEnv != "/usr/bin" {
 		t.Errorf("PathEnv = %q, want /usr/bin", opt.PathEnv)
 	}
+	if ghToken != "" {
+		t.Errorf("ghToken = %q, want empty (GH_TOKEN/GITHUB_TOKEN unset)", ghToken)
+	}
 }
 
 func TestSandboxOptionsXDGRuntimeDirFromEnv(t *testing.T) {
 	env := map[string]string{"XDG_RUNTIME_DIR": "/run/user/42", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/42/bus"}
 	getenv := func(k string) string { return env[k] }
 
-	opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+	opt, _ := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
 	if opt.XDGRuntimeDir != "/run/user/42" {
 		t.Errorf("XDGRuntimeDir = %q, want /run/user/42", opt.XDGRuntimeDir)
 	}
@@ -31,13 +34,17 @@ func TestSandboxOptionsXDGRuntimeDirFromEnv(t *testing.T) {
 	}
 }
 
+// Case 6 (issue #25): the GH_TOKEN -> GITHUB_TOKEN resolution logic itself is
+// unchanged by the fd-transport rework — sandboxOptions still returns the
+// resolved token value (now as its own return value, never inside
+// sandbox.Options, per Case 3) so the caller can pipe it in.
 func TestSandboxOptionsGHTokenForwarded(t *testing.T) {
 	env := map[string]string{"GH_TOKEN": "ghp_TESTDUMMY"}
 	getenv := func(k string) string { return env[k] }
 
-	opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
-	if opt.GHToken != "ghp_TESTDUMMY" {
-		t.Errorf("GHToken = %q, want ghp_TESTDUMMY", opt.GHToken)
+	_, ghToken := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+	if ghToken != "ghp_TESTDUMMY" {
+		t.Errorf("ghToken = %q, want ghp_TESTDUMMY", ghToken)
 	}
 }
 
@@ -45,18 +52,18 @@ func TestSandboxOptionsGHTokenFallsBackToGithubToken(t *testing.T) {
 	env := map[string]string{"GITHUB_TOKEN": "ghs_TESTDUMMY"}
 	getenv := func(k string) string { return env[k] }
 
-	opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
-	if opt.GHToken != "ghs_TESTDUMMY" {
-		t.Errorf("GHToken = %q, want ghs_TESTDUMMY (fallback from GITHUB_TOKEN)", opt.GHToken)
+	_, ghToken := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+	if ghToken != "ghs_TESTDUMMY" {
+		t.Errorf("ghToken = %q, want ghs_TESTDUMMY (fallback from GITHUB_TOKEN)", ghToken)
 	}
 }
 
 func TestSandboxOptionsGHTokenEmptyWhenBothUnset(t *testing.T) {
 	getenv := func(k string) string { return "" }
 
-	opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
-	if opt.GHToken != "" {
-		t.Errorf("GHToken = %q, want empty when GH_TOKEN/GITHUB_TOKEN both unset", opt.GHToken)
+	_, ghToken := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+	if ghToken != "" {
+		t.Errorf("ghToken = %q, want empty when GH_TOKEN/GITHUB_TOKEN both unset", ghToken)
 	}
 }
 
@@ -88,7 +95,7 @@ func TestSandboxOptionsDBusScrubbedByOptIn(t *testing.T) {
 			}
 			getenv := func(k string) string { return env[k] }
 
-			opt := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
+			opt, _ := sandboxOptions(Options{Home: "/home/x", Getenv: getenv}, "/work", "http://127.0.0.1:1")
 			if opt.DBusAddress != tc.wantOut {
 				t.Errorf("DBusAddress = %q, want %q", opt.DBusAddress, tc.wantOut)
 			}

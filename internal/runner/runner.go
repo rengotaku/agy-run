@@ -223,6 +223,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	// error (issue #15).
 	var netLogPath string
 	var sandboxWarn string
+	var extraFiles []*os.File
 	if cfg.Sandbox {
 		if _, err := exec.LookPath("bwrap"); err != nil {
 			sandboxWarn = "bwrap (bubblewrap) が未導入のため、このrunは非サンドボックスで実行しました（FS隔離・通信記録なし）。bubblewrap を入れると --sandbox の隔離＋記録が有効になります。"
@@ -256,12 +257,39 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 			return errResult("bwrap_not_found", lerr), config.ExitUsage, logFile
 		}
 
-		sbOpt := sandboxOptions(opt, effectiveWorkDir(cfg), "http://"+addr)
+		sbOpt, ghToken := sandboxOptions(opt, effectiveWorkDir(cfg), "http://"+addr)
+
+		// GH_TOKEN is handed to bwrap through a pipe, never through argv/env
+		// of bwrap itself (issue #25 — /proc/<pid>/cmdline is world-readable
+		// to same-uid processes, and bwrap's --setenv used to leak the value
+		// there). sandbox.Options only ever learns the fd *number*: the pipe
+		// read end becomes ExtraFiles[0], which Go always places at fd 3 in
+		// the child (fds 0-2 are stdin/stdout/stderr).
+		if ghToken != "" {
+			pr, pw, perr := os.Pipe()
+			if perr != nil {
+				_ = bodyCap.Close()
+				return errResult("gh_token_pipe_failed", perr), config.ExitUsage, logFile
+			}
+			defer func() { _ = pr.Close() }()
+			go func(w *os.File, token string) {
+				_, _ = io.WriteString(w, token)
+				_ = w.Close()
+			}(pw, ghToken)
+			extraFiles = append(extraFiles, pr)
+			sbOpt.GHTokenFD = 3
+		}
+
 		bwrapArgs := sandbox.BuildArgs(sbOpt)
 
+		execArgv := append([]string{paths.AgyBin}, agyArgv...)
+		if sbOpt.GHTokenFD > 0 {
+			execArgv = sandbox.WrapExecWithSecretEnv(sandbox.GHTokenSecretPath, "GH_TOKEN", execArgv)
+		}
+
 		binPath = bwrapBin
-		spawnArgv = append(append([]string{}, bwrapArgs...), "--", paths.AgyBin)
-		spawnArgv = append(spawnArgv, agyArgv...)
+		spawnArgv = append(append([]string{}, bwrapArgs...), "--")
+		spawnArgv = append(spawnArgv, execArgv...)
 	}
 
 	// agy's stdout is captured (not forwarded live): the raw body is folded into
@@ -270,6 +298,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	cmd.Stdin = devnull
 	cmd.Stdout = bodyCap
 	cmd.Stderr = opt.Stderr
+	cmd.ExtraFiles = extraFiles
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// On any runCtx cancellation (a received signal, or normal teardown) kill
 	// agy's WHOLE process group, not just the direct child, so no descendant is

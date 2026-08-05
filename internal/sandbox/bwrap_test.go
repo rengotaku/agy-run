@@ -3,6 +3,7 @@ package sandbox
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -274,19 +275,89 @@ func TestBuildArgsBinLibSymlinkOrRoBind(t *testing.T) {
 	}
 }
 
-func TestBuildArgsGHTokenSetenv(t *testing.T) {
-	got := BuildArgs(Options{Home: t.TempDir(), GHToken: "ghp_TESTDUMMY"})
-	if !containsSeq(got, []string{"--setenv", "GH_TOKEN", "ghp_TESTDUMMY"}) {
-		t.Errorf("expected --setenv GH_TOKEN ghp_TESTDUMMY\nargs: %v", got)
+// Case 1 (issue #25): GHTokenFD == 0 (no token) — neither --ro-bind-data nor
+// the old --setenv GH_TOKEN <value> form may appear.
+func TestBuildArgsGHTokenFDZeroOmitsRoBindDataAndSetenv(t *testing.T) {
+	got := BuildArgs(Options{Home: t.TempDir()})
+	for i, s := range got {
+		if s == "--ro-bind-data" {
+			t.Fatalf("--ro-bind-data should not appear when GHTokenFD is 0: %v (index %d)", got, i)
+		}
+		if s == "--setenv" && i+1 < len(got) && got[i+1] == "GH_TOKEN" {
+			t.Fatalf("--setenv GH_TOKEN should not appear: %v (index %d)", got, i)
+		}
 	}
 }
 
-func TestBuildArgsGHTokenEmptyOmitsSetenv(t *testing.T) {
-	got := BuildArgs(Options{Home: t.TempDir()})
+// Case 2 (issue #25): GHTokenFD == 3 (token present, fd 3 is where
+// exec.Cmd.ExtraFiles[0] lands in the child) — BuildArgs must add
+// --perms 0600 --file 3 <fixed secret path> and must never fall back to
+// --setenv GH_TOKEN <value> (that argv leak is exactly the vulnerability this
+// issue fixes). It must also never use --ro-bind-data: that flag creates a
+// bind mount, and `rm -f` on a bind-mount point always fails with EBUSY
+// regardless of ro/rw, so the one-shot delete in WrapExecWithSecretEnv would
+// silently no-op and leave the secret file readable for the sandboxed
+// process's whole lifetime (codex review on issue #25 PR).
+func TestBuildArgsGHTokenFDAddsRoBindData(t *testing.T) {
+	got := BuildArgs(Options{Home: t.TempDir(), GHTokenFD: 3})
+	if !containsSeq(got, []string{"--perms", "0600", "--file", "3", GHTokenSecretPath}) {
+		t.Errorf("expected --perms 0600 --file 3 %s\nargs: %v", GHTokenSecretPath, got)
+	}
 	for i, s := range got {
-		if s == "GH_TOKEN" {
-			t.Fatalf("GH_TOKEN should not appear when GHToken is empty: %v (index %d)", got, i)
+		if s == "--setenv" && i+1 < len(got) && got[i+1] == "GH_TOKEN" {
+			t.Fatalf("--setenv GH_TOKEN must not reappear: %v (index %d)", got, i)
 		}
+		if s == "--ro-bind-data" {
+			t.Fatalf("--ro-bind-data must not be used for the GH_TOKEN secret (rm -f would EBUSY on a bind-mount point): %v (index %d)", got, i)
+		}
+	}
+}
+
+// Case 3 (issue #25): Options must not hold a plaintext-token field (a string
+// field meant to carry the token's real value) — the sandbox package must be
+// structurally unable to touch the token's value, only its fd number.
+func TestOptionsHasNoPlaintextGHTokenField(t *testing.T) {
+	typ := reflect.TypeOf(Options{})
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.Name == "GHTokenFD" {
+			continue
+		}
+		if strings.Contains(strings.ToLower(f.Name), "token") && f.Type.Kind() == reflect.String {
+			t.Fatalf("Options must not hold a plaintext token field: %s (%s)", f.Name, f.Type)
+		}
+	}
+	fdField, ok := typ.FieldByName("GHTokenFD")
+	if !ok {
+		t.Fatal("Options must have a GHTokenFD field")
+	}
+	if fdField.Type.Kind() != reflect.Int {
+		t.Errorf("GHTokenFD type = %s, want int", fdField.Type)
+	}
+}
+
+// Case 4 (issue #25): WrapExecWithSecretEnv must build the sh -c wrapper argv
+// with the secret path / env var only inside the script text (no token value
+// involved at this layer at all — it only ever sees an fd number, not a
+// string), and argv[0]/rest passed as "$0"/"$@" positional parameters.
+func TestWrapExecWithSecretEnvFormat(t *testing.T) {
+	argv := []string{"/path/to/agy", "-p", "hello world"}
+	got := WrapExecWithSecretEnv("/tmp/.agy-run-gh-token", "GH_TOKEN", argv)
+
+	want := []string{
+		"/bin/sh", "-c",
+		`export GH_TOKEN="$(cat /tmp/.agy-run-gh-token)"; rm -f /tmp/.agy-run-gh-token; exec "$0" "$@"`,
+		"/path/to/agy", "-p", "hello world",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("WrapExecWithSecretEnv =\n%v\nwant\n%v", got, want)
+	}
+}
+
+func TestWrapExecWithSecretEnvEmptyArgvReturnsUnchanged(t *testing.T) {
+	got := WrapExecWithSecretEnv("/tmp/.agy-run-gh-token", "GH_TOKEN", nil)
+	if got != nil {
+		t.Errorf("WrapExecWithSecretEnv(nil argv) = %v, want nil", got)
 	}
 }
 
