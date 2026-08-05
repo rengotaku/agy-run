@@ -9,6 +9,24 @@ import (
 	"github.com/rengotaku/agy-run/internal/sandbox"
 )
 
+// bwrapUsable reports whether bwrap is not just on PATH but can actually
+// create a sandbox (unshare-all requires unprivileged user namespaces, which
+// some hardened hosts/containers disable even with bwrap installed — issue
+// #25 review). It runs a minimal real bwrap invocation and treats any
+// non-zero exit as "unusable" rather than trying to distinguish exact causes.
+func bwrapUsable() bool {
+	bwrapPath, err := exec.LookPath("bwrap")
+	if err != nil {
+		return false
+	}
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		return false
+	}
+	cmd := exec.Command(bwrapPath, "--unshare-all", "--ro-bind", "/", "/", "--dev", "/dev", "--", truePath)
+	return cmd.Run() == nil
+}
+
 // Case 5 (issue #25): the direct regression test for the vulnerability —
 // GH_TOKEN must reach the sandboxed process via the fd/--file path
 // (proving the transport actually works) while never appearing, as a string,
@@ -21,8 +39,8 @@ import (
 // regression in either function is caught here without needing to run the
 // full attempt()/proxy/watchdog machinery.
 func TestGHTokenReachesSandboxOnlyViaPipeNeverViaArgv(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not on PATH; skipping sandbox integration test")
+	if !bwrapUsable() {
+		t.Skip("bwrap not usable (missing binary or unprivileged user namespaces disabled); skipping sandbox integration test")
 	}
 
 	const dummyToken = "dummy-secret-abc123"
@@ -89,8 +107,8 @@ func TestGHTokenReachesSandboxOnlyViaPipeNeverViaArgv(t *testing.T) {
 // same sandbox instance* (checked before the sandbox's own tmpfs is torn
 // down) rather than merely asserting bwrap's exit code.
 func TestGHTokenSecretFileActuallyRemovedAfterExec(t *testing.T) {
-	if _, err := exec.LookPath("bwrap"); err != nil {
-		t.Skip("bwrap not on PATH; skipping sandbox integration test")
+	if !bwrapUsable() {
+		t.Skip("bwrap not usable (missing binary or unprivileged user namespaces disabled); skipping sandbox integration test")
 	}
 
 	const dummyToken = "dummy-secret-abc123"
