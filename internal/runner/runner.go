@@ -550,9 +550,26 @@ func listModels(agyBin string) (models []string, ok bool) {
 	if err != nil {
 		return nil, false
 	}
-	for _, ln := range strings.Split(string(out), "\n") {
-		if s := strings.TrimSpace(ln); s != "" {
-			models = append(models, s)
+	lines := strings.Split(string(out), "\n")
+	hasTab := false
+	for _, ln := range lines {
+		if strings.Contains(ln, "\t") {
+			hasTab = true
+			break
+		}
+	}
+	for _, ln := range lines {
+		ln = strings.TrimRight(ln, "\r")
+		if hasTab {
+			if id, _, found := strings.Cut(ln, "\t"); found {
+				if id = strings.TrimSpace(id); id != "" {
+					models = append(models, id)
+				}
+			}
+		} else {
+			if s := strings.TrimSpace(ln); s != "" {
+				models = append(models, s)
+			}
 		}
 	}
 	return models, len(models) > 0

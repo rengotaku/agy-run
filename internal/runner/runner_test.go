@@ -36,7 +36,9 @@ const stubConv = "11111111-1111-1111-1111-111111111111"
 //	STUB_RESET     the "Resets in <dur>" value written on a rate-limit
 const stubAgy = `#!/bin/sh
 if [ "$1" = "models" ]; then
-  printf '%s\n' "Gemini 3.5 Flash (High)" "Gemini 3.1 Pro (High)"
+  printf 'Fetching available models...\n'
+  printf 'gemini-3.5-flash-high\tGemini 3.5 Flash (High)\n'
+  printf 'gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n'
   exit 0
 fi
 logfile=""
@@ -160,7 +162,7 @@ func TestRunUnknownModel(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "should not run")
 
-	rc, out, _ := run(t, home, []string{"-m", "Gemnini 3.5 Flash (Hihg)", "hi"})
+	rc, out, _ := run(t, home, []string{"-m", "gemini-3.5-flash-invalid", "hi"})
 	if rc != config.ExitUsage {
 		t.Fatalf("rc = %d, want 2 (usage)", rc)
 	}
@@ -171,12 +173,18 @@ func TestRunUnknownModel(t *testing.T) {
 	// The valid list is returned so the caller can retry correctly.
 	found := false
 	for _, m := range r.Error.AvailableModels {
-		if m == "Gemini 3.5 Flash (High)" {
+		if m == "gemini-3.5-flash-high" {
 			found = true
+		}
+		if strings.Contains(m, "\t") || strings.Contains(m, "Gemini") || strings.Contains(m, "Fetching") {
+			t.Errorf("available_models contain unparsed format or progress line: %q", m)
 		}
 	}
 	if !found {
 		t.Errorf("available_models missing valid name: %v", r.Error.AvailableModels)
+	}
+	if len(r.Error.AvailableModels) != 2 {
+		t.Errorf("available_models count = %d, want 2: %v", len(r.Error.AvailableModels), r.Error.AvailableModels)
 	}
 }
 
@@ -184,7 +192,7 @@ func TestRunValidModelPasses(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "ok")
 
-	rc, out, _ := run(t, home, []string{"-m", "Gemini 3.5 Flash (High)", "hi"})
+	rc, out, _ := run(t, home, []string{"-m", "gemini-3.5-flash-high", "hi"})
 	if rc != config.ExitOK {
 		t.Fatalf("rc = %d, want 0", rc)
 	}
@@ -416,15 +424,15 @@ func TestRunWorkspaceSetsCmdDir(t *testing.T) {
 func TestRunModelFallback(t *testing.T) {
 	home := newHome(t)
 	t.Setenv("STUB_BODY", "ok from fallback")
-	t.Setenv("STUB_RL_MODEL", "Gemini 3.5 Flash (High)") // A rate-limits
+	t.Setenv("STUB_RL_MODEL", "gemini-3.5-flash-high") // A rate-limits
 
 	rc, out, errb := run(t, home,
-		[]string{"-m", "Gemini 3.5 Flash (High),Gemini 3.1 Pro (High)", "do it"})
+		[]string{"-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "do it"})
 	if rc != config.ExitOK {
 		t.Fatalf("rc = %d, want 0 (fallback should succeed)\nstderr: %s", rc, errb)
 	}
 	r := parseResult(t, out)
-	if r.Model != "Gemini 3.1 Pro (High)" {
+	if r.Model != "gemini-3.1-pro-high" {
 		t.Errorf("used model = %q, want the fallback candidate", r.Model)
 	}
 	if r.Error != nil {
@@ -444,7 +452,7 @@ func TestRunModelFallbackExhausted(t *testing.T) {
 	t.Setenv("STUB_COUNT_FILE", filepath.Join(t.TempDir(), "n"))
 
 	rc, out, _ := run(t, home,
-		[]string{"-m", "Gemini 3.5 Flash (High),Gemini 3.1 Pro (High)", "do it"})
+		[]string{"-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "do it"})
 	if rc != config.ExitRateLimited {
 		t.Fatalf("rc = %d, want 42", rc)
 	}
@@ -630,5 +638,34 @@ func TestRunPassesThroughAgyExitCode(t *testing.T) {
 	}
 	if !strings.Contains(r.Body, "partial") {
 		t.Errorf("body = %q", r.Body)
+	}
+}
+
+func TestRunLegacyModelFormat(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyStub := `#!/bin/sh
+if [ "$1" = "models" ]; then
+  printf '%s\n' "Gemini 3.5 Flash (High)" "Gemini 3.1 Pro (High)"
+  exit 0
+fi
+printf 'ok\n'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(legacyStub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("STUB_CONV", stubConv)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+
+	rc, out, _ := run(t, home, []string{"-m", "Gemini 3.5 Flash (High)", "hi"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0 (legacy format model should pass)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil {
+		t.Errorf("legacy model format should not error: %+v", r.Error)
 	}
 }
