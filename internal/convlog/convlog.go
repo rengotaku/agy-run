@@ -22,7 +22,7 @@ var (
 	// "Created conversation <uuid>"
 	convCreatedRe = regexp.MustCompile(`Created conversation ([0-9a-f-]{36})`)
 	// "The user changed setting `Model Selection` from ... to <ModelName>."
-	modelSelectionRe = regexp.MustCompile(`The user changed setting ` + "`" + `Model Selection` + "`" + ` from .* to (.*?)(?:\.\s|\."|\.\n|\.\r|\.$|"\n|"\r|"$|\n|\r|$)`)
+	modelSelectionRe = regexp.MustCompile(`The user changed setting ` + "`" + `Model Selection` + "`" + ` from .*? to (.*?)(?:\. |\.$|\."|\.\n|\.\r|"\n|"\r|"$|\n|\r|$)`)
 )
 
 // UnresolvedModel is recorded in index.jsonl when effective model resolution fails or yields no value.

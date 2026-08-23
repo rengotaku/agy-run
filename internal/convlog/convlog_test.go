@@ -367,6 +367,20 @@ func TestC10_NormalizeModelName_AlreadyID(t *testing.T) {
 	}
 }
 
+// 回帰テスト: TestC11_RealTranscriptMarkerFormat / モデル名の後に文が続く実形式で誤った部分文字列を拾わないこと
+func TestC11_RealTranscriptMarkerFormat(t *testing.T) {
+	trPath := "testdata/transcript_real_marker.jsonl"
+	modelMap := map[string]string{
+		"Gemini 3.1 Pro (High)": "gemini-3.1-pro-high",
+	}
+
+	got := ResolveEffectiveModel("", trPath, "", modelMap)
+	if got != "gemini-3.1-pro-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.1-pro-high")
+	}
+}
+
+
 
 
 
