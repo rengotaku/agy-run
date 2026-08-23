@@ -339,9 +339,14 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	convID := convlog.ResolveConvID(logFile)
 	body := readBody(bodyPath)
 
-	tp := convlog.TranscriptPath(paths.BrainDir, convID)
-	_, modelMap, _ := listModelMapFunc(paths.AgyBin)
-	effectiveModel := convlog.ResolveEffectiveModel(model, tp, paths.Settings, modelMap)
+	var effectiveModel string
+	if model != "" {
+		effectiveModel = model
+	} else {
+		tp := convlog.TranscriptPath(paths.BrainDir, convID)
+		_, modelMap, _ := listModelMapFunc(paths.AgyBin)
+		effectiveModel = convlog.ResolveEffectiveModel(model, tp, paths.Settings, modelMap)
+	}
 
 	rec := index.Record{
 		TSStart:         tsStart,

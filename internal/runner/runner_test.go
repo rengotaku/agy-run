@@ -2,7 +2,9 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -716,6 +718,55 @@ printf 'ok\n'
 		t.Errorf("index content = %s, want model to be resolved as gemini-3.1-pro-high", string(data))
 	}
 }
+
+// 回帰テスト: TestC12_ModelFlagSkipsModelListLookup / -m 指定時に対応表の取得を行わず指定値がそのまま記録されること
+func TestC12_ModelFlagSkipsModelListLookup(t *testing.T) {
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := "#!/bin/sh\nexit 0\n"
+	agyPath := filepath.Join(binDir, "agy")
+	if err := os.WriteFile(agyPath, []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := DefaultPaths(home, func(string) string { return "" })
+	paths.AgyBin = agyPath
+
+	listCalled := false
+	orig := listModelMapFunc
+	listModelMapFunc = func(agyBin string) ([]string, map[string]string, bool) {
+		listCalled = true
+		return orig(agyBin)
+	}
+	t.Cleanup(func() {
+		listModelMapFunc = orig
+	})
+
+	cfg := config.Config{
+		Model: "gemini-3.6-flash-high",
+	}
+
+	_, _, _ = attempt(context.Background(), cfg, "gemini-3.6-flash-high", Options{Home: home, Getenv: func(string) string { return "" }}, emit.New(io.Discard, io.Discard), paths)
+
+	if listCalled {
+		t.Errorf("expected listModelMapFunc not to be called in attempt when model is specified, but it was called")
+	}
+
+	indexPath := paths.IndexFile
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("failed to read index.jsonl: %v", err)
+	}
+	if !strings.Contains(string(data), `"model":"gemini-3.6-flash-high"`) {
+		t.Errorf("index content = %s, want model gemini-3.6-flash-high", string(data))
+	}
+}
+
+
+
 
 
 // A7: 本文ゼロ + ログに rate limit キーワード + 成果物ツール呼び出しあり ->
