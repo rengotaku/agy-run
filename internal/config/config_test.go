@@ -91,9 +91,10 @@ func TestParseEnvKnobs(t *testing.T) {
 		"AGY_RUN_IDLE_LIMIT":      "120",
 		"AGY_RUN_ABS_LIMIT":       "1800",
 		"AGY_RUN_POLL":            "10",
+		"AGY_RUN_TOOL_REPEAT_LIMIT": "5",
 	})
 	cfg, _, _ := Parse([]string{"x"}, env)
-	if cfg.MaxConcurrency != 5 || cfg.IdleLimitSec != 120 || cfg.AbsLimitSec != 1800 || cfg.PollSec != 10 {
+	if cfg.MaxConcurrency != 5 || cfg.IdleLimitSec != 120 || cfg.AbsLimitSec != 1800 || cfg.PollSec != 10 || cfg.ToolRepeatLimit != 5 {
 		t.Errorf("env knobs = %+v", cfg)
 	}
 }
