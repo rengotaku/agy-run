@@ -985,5 +985,90 @@ func TestRunner_ToolStallWarning(t *testing.T) {
 	}
 }
 
+// TestD7_StallExitStillDetectsToolRepeat: 同一ツールが閾値超で繰り返され成果物0件、stall(exit 44)で終了時にwarningsが入ることの検証
+func TestD7_StallExitStillDetectsToolRepeat(t *testing.T) {
+	home := newHome(t)
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", stubConv, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var sb strings.Builder
+	t0 := time.Now().Add(time.Second)
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
+
+	t.Setenv("STUB_BODY", "thinking...")
+	t.Setenv("STUB_SLEEP", "10")
+	t.Setenv("AGY_RUN_IDLE_LIMIT", "1")
+	t.Setenv("AGY_RUN_POLL", "1")
+	t.Setenv("AGY_RUN_TOOL_REPEAT_LIMIT", "10")
+
+	rc, out, _ := run(t, home, []string{"long task"})
+	if rc != config.ExitStall {
+		t.Fatalf("rc = %d, want 44 (stall)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "stall" {
+		t.Errorf("expected stall error, got: %+v", r.Error)
+	}
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected stall warning in warnings on stall exit, got warnings: %v", r.Warnings)
+	}
+}
+
+// TestD8_AbsTimeoutStillDetectsToolRepeat: 同一ツールが閾値超で繰り返され成果物0件、abs_timeout(exit 124)で終了時にwarningsが入ることの検証
+func TestD8_AbsTimeoutStillDetectsToolRepeat(t *testing.T) {
+	home := newHome(t)
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", stubConv, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var sb strings.Builder
+	t0 := time.Now().Add(time.Second)
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
+
+	t.Setenv("STUB_BODY", "thinking...")
+	t.Setenv("STUB_SLEEP", "10")
+	t.Setenv("AGY_RUN_IDLE_LIMIT", "100")
+	t.Setenv("AGY_RUN_ABS_LIMIT", "1")
+	t.Setenv("AGY_RUN_POLL", "1")
+	t.Setenv("AGY_RUN_TOOL_REPEAT_LIMIT", "10")
+
+	rc, out, _ := run(t, home, []string{"long task"})
+	if rc != config.ExitAbsTimeout {
+		t.Fatalf("rc = %d, want 124 (abs_timeout)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "timeout" {
+		t.Errorf("expected timeout error, got: %+v", r.Error)
+	}
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected stall warning in warnings on abs_timeout exit, got warnings: %v", r.Warnings)
+	}
+}
+
 
 

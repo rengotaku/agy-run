@@ -379,6 +379,20 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		r.NetLog = netLogPath
 	}
 
+	// artifacts: new images written under brain/<conv>/ during this run.
+	arts := convlog.NewImageArtifacts(paths.BrainDir, convID, start)
+	if len(arts) > 0 {
+		rec.Artifacts = arts
+		r.Artifacts = arts
+	}
+
+	// Stalled tool call detection (record warning, do not stop execution).
+	if tp := convlog.TranscriptPath(paths.BrainDir, convID); tp != "" {
+		if warn := convlog.DetectToolStall(tp, r.Artifacts, cfg.ToolRepeatLimit, start); warn != "" {
+			r.Warnings = append(r.Warnings, warn)
+		}
+	}
+
 	// Stall / absolute-timeout branches: log tail to stderr, error in the result.
 	if reason == watchdog.Stall || reason == watchdog.AbsTimeout {
 		touch(paths.KillStamp)
@@ -396,13 +410,6 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		if dst, ok := copyBody(paths.LastBodyDir, convID, bodyPath); ok {
 			r.BodyFile = dst
 		}
-	}
-
-	// artifacts: new images written under brain/<conv>/ during this run.
-	arts := convlog.NewImageArtifacts(paths.BrainDir, convID, start)
-	if len(arts) > 0 {
-		rec.Artifacts = arts
-		r.Artifacts = arts
 	}
 
 	// RUN_COMMAND audit: surface agy's failed build/test steps so a caller does
@@ -437,13 +444,6 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 				r.Error = err
 				rc = config.ExitArtifactMissing
 			}
-		}
-	}
-
-	// Stalled tool call detection (record warning, do not stop execution).
-	if tp := convlog.TranscriptPath(paths.BrainDir, convID); tp != "" {
-		if warn := convlog.DetectToolStall(tp, r.Artifacts, cfg.ToolRepeatLimit, start); warn != "" {
-			r.Warnings = append(r.Warnings, warn)
 		}
 	}
 
