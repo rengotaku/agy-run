@@ -18,7 +18,10 @@
 - **RUN_COMMAND 監査**: agy の build/test 失敗をログから拾い `run_command_failures` / `warnings` に出す（自己申告「テスト緑」の誤信防止）
 - **非空本文でのレート制限警告**: 本文が返っているがログに 429（レート制限）の兆候がある場合、`exit_code` や `error` は変更せず `warnings` に記録する（調査タスク等での誤検知による中断を防ぎつつレート制限を可視化）
 - **成果物欠落検知**: 成果物生成ツール（`generate_image`）を実行したのに artifacts が 0 件の場合は `artifact_missing` として失敗扱い（`exit 43`）
+- **実効モデルの記録**: `index.jsonl` の `model` には「`-m` 指定時はその値 / 解決できれば kebab-case ID / 対応表に無ければ表示名のまま / どれも取れなければ `(unresolved)`」を記録
+
 - **出力契約**: stdout=結果 JSON、stderr=人向けメタのみ
+
 
 ## 使い方
 

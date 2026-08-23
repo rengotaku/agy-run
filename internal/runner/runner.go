@@ -339,6 +339,15 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	convID := convlog.ResolveConvID(logFile)
 	body := readBody(bodyPath)
 
+	var effectiveModel string
+	if model != "" {
+		effectiveModel = model
+	} else {
+		tp := convlog.TranscriptPath(paths.BrainDir, convID)
+		_, modelMap, _ := listModelMapFunc(paths.AgyBin)
+		effectiveModel = convlog.ResolveEffectiveModel(model, tp, paths.Settings, modelMap)
+	}
+
 	rec := index.Record{
 		TSStart:         tsStart,
 		TSEnd:           end.Format(time.RFC3339),
@@ -347,7 +356,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
 		ConversationID:  index.ConvPtr(convID),
 		Continued:       cfg.Continued(),
-		Model:           model,
+		Model:           effectiveModel,
 		CWD:             effectiveWorkDir(cfg),
 		Prompt:          cfg.Prompt,
 		Artifacts:       []string{},
@@ -544,16 +553,23 @@ func printLogTail(e *emit.Emitter, logFile string) {
 	}
 }
 
-// listModels returns the model names from `agy models` (one per line). ok is
-// false on any error so the caller can skip validation rather than block.
-func listModels(agyBin string) (models []string, ok bool) {
+var listModelMapFunc = listModelMap
+
+func listModelMap(agyBin string) (models []string, modelMap map[string]string, ok bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	out, err := commandContext(ctx, agyBin, []string{"models"}).Output()
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
-	lines := strings.Split(string(out), "\n")
+	models, modelMap = parseModelsAndMap(string(out))
+	return models, modelMap, len(models) > 0
+}
+
+func parseModelsAndMap(out string) ([]string, map[string]string) {
+	var models []string
+	modelMap := make(map[string]string)
+	lines := strings.Split(out, "\n")
 	hasTab := false
 	for _, ln := range lines {
 		if strings.Contains(ln, "\t") {
@@ -564,18 +580,32 @@ func listModels(agyBin string) (models []string, ok bool) {
 	for _, ln := range lines {
 		ln = strings.TrimRight(ln, "\r")
 		if hasTab {
-			if id, _, found := strings.Cut(ln, "\t"); found {
-				if id = strings.TrimSpace(id); id != "" {
+			if id, name, found := strings.Cut(ln, "\t"); found {
+				id = strings.TrimSpace(id)
+				name = strings.TrimSpace(name)
+				if id != "" {
 					models = append(models, id)
+					if name != "" {
+						modelMap[name] = id
+					}
+					modelMap[id] = id
 				}
 			}
 		} else {
 			if s := strings.TrimSpace(ln); s != "" {
 				models = append(models, s)
+				modelMap[s] = s
 			}
 		}
 	}
-	return models, len(models) > 0
+	return models, modelMap
+}
+
+// listModels returns the model names from `agy models` (one per line). ok is
+// false on any error so the caller can skip validation rather than block.
+func listModels(agyBin string) (models []string, ok bool) {
+	models, _, ok = listModelMapFunc(agyBin)
+	return models, ok
 }
 
 // contains reports whether s is exactly one of items.
