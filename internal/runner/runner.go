@@ -406,14 +406,17 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	}
 
 	// Rate-limit / artifact-missing / empty-output / generic-failure classification.
-	if len(body) == 0 {
-		hits := ratelimit.CountHits(logFile)
-		if hits > 0 {
+	if hits := ratelimit.CountHits(logFile); hits > 0 {
+		if len(body) == 0 {
 			r.Error = &emit.Error{
 				Reason: "rate_limited", LogRatelimitHits: hits,
 				Hint: "agyの5時間枠/レート上限の可能性。-m にフォールバック候補を並べるか --wait-quota でリセット待機を検討。",
 			}
 			rc = config.ExitRateLimited // contract: 42 = empty body + rate-limit signature, whatever agy's own exit code was.
+		} else {
+			r.Warnings = append(r.Warnings, fmt.Sprintf(
+				"本文は返っていますがログにレート制限の兆候があります (レート制限シグネチャのヒット数: %d)。exit_code は変更されていません。",
+				hits))
 		}
 	}
 
