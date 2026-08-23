@@ -82,3 +82,81 @@ func TestResetWaitNoHint(t *testing.T) {
 		t.Error("missing file should yield ok=false")
 	}
 }
+
+func TestE1(t *testing.T) {
+	line := "I0823 11:43:26.632945 156 quota_manager.go:45] doRefreshQuota: starting reload (force=true)\n"
+	if got := countHits(strings.NewReader(line)); got != 0 {
+		t.Errorf("TestE1: countHits = %d, want 0", got)
+	}
+}
+
+func TestE2(t *testing.T) {
+	line := "W0823 11:43:23.208429 66 cache.go:123] cache update failed\n"
+	if got := countHits(strings.NewReader(line)); got != 0 {
+		t.Errorf("TestE2: countHits = %d, want 0", got)
+	}
+}
+
+func TestE3(t *testing.T) {
+	line := "HTTP 429 Too Many Requests\n"
+	if got := countHits(strings.NewReader(line)); got < 1 {
+		t.Errorf("TestE3: countHits = %d, want >= 1", got)
+	}
+}
+
+func TestE4(t *testing.T) {
+	line := "error: RESOURCE_EXHAUSTED: quota exceeded\n"
+	if got := countHits(strings.NewReader(line)); got < 1 {
+		t.Errorf("TestE4: countHits = %d, want >= 1", got)
+	}
+}
+
+func TestE5(t *testing.T) {
+	line := "quota exceeded for user\n"
+	if got := countHits(strings.NewReader(line)); got < 1 {
+		t.Errorf("TestE5: countHits = %d, want >= 1", got)
+	}
+}
+
+func TestE6(t *testing.T) {
+	line := "quotaProject=my-project-123\n"
+	if got := countHits(strings.NewReader(line)); got != 0 {
+		t.Errorf("TestE6: countHits = %d, want 0", got)
+	}
+}
+
+func TestE7(t *testing.T) {
+	log := `ERROR: logging before google.Init:
+I0823 11:43:23.208000 66 main.go:10] starting agy
+W0823 11:43:23.208429 66 cache.go:123] cache update failed
+I0823 11:43:26.632945 156 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0823 11:43:26.633000 156 quota_manager.go:50] reload complete
+I0823 11:43:26.634000 156 config.go:80] quotaProject=my-project-123
+`
+	if got := countHits(strings.NewReader(log)); got != 0 {
+		t.Errorf("TestE7: countHits = %d, want 0", got)
+	}
+}
+
+func TestE8(t *testing.T) {
+	log := `ERROR: logging before google.Init:
+W0823 11:43:23.208429 66 cache.go:123] cache update failed
+I0823 11:43:26.632945 156 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+HTTP 429 Too Many Requests
+`
+	if got := countHits(strings.NewReader(log)); got < 1 {
+		t.Errorf("TestE8: countHits = %d, want >= 1", got)
+	}
+}
+
+func TestAdd_Status429AndEmbeddedNumbers(t *testing.T) {
+	// 追加テスト: TestAdd_Status429AndEmbeddedNumbers / 記号区切りの429検知と埋め込み数値の誤検知排除検証
+	if got := countHits(strings.NewReader("status:429 error\n[429] limit\n")); got != 2 {
+		t.Errorf("TestAdd_Status429AndEmbeddedNumbers symbol boundary = %d, want 2", got)
+	}
+	if got := countHits(strings.NewReader("id=1234295\nvar429abc\n")); got != 0 {
+		t.Errorf("TestAdd_Status429AndEmbeddedNumbers embedded number = %d, want 0", got)
+	}
+}
+
+

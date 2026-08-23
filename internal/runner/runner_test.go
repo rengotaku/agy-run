@@ -1070,5 +1070,36 @@ func TestD8_AbsTimeoutStillDetectsToolRepeat(t *testing.T) {
 	}
 }
 
+func TestE9(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 Too Many Requests")
+
+	rc, out, _ := run(t, home, []string{"hi"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("TestE9: rc = %d, want %d (ExitRateLimited)", rc, config.ExitRateLimited)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("TestE9: expected rate_limited error, got %+v", r.Error)
+	}
+}
+
+func TestE10(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_LOG_EXTRA", "I0823 11:43:26.632945 156 quota_manager.go:45] doRefreshQuota: starting reload (force=true)\nW0823 11:43:23.208429 66 cache.go:123] cache update failed\nconfig.go:80] quotaProject=my-project-123")
+
+	rc, out, _ := run(t, home, []string{"hi"})
+	if rc == config.ExitRateLimited {
+		t.Fatalf("TestE10: rc = %d, want not %d (should not be ExitRateLimited)", rc, config.ExitRateLimited)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil && r.Error.Reason == "rate_limited" {
+		t.Errorf("TestE10: should not be rate_limited, got %+v", r.Error)
+	}
+}
+
+
 
 
