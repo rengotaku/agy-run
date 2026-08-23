@@ -13,9 +13,10 @@ import (
 const (
 	ExitOK          = 0   // success
 	ExitUsage       = 2   // bad flags / missing prompt
-	ExitLockTimeout = 4   // could not acquire a concurrency slot within -w
-	ExitRateLimited = 42  // empty body + rate-limit signature in log
-	ExitStall       = 44  // idle watchdog: heartbeat stalled past idle limit
+	ExitLockTimeout      = 4   // could not acquire a concurrency slot within -w
+	ExitRateLimited      = 42  // empty body + rate-limit signature in log
+	ExitArtifactMissing  = 43  // artifact-generating tools called but zero artifacts written
+	ExitStall            = 44  // idle watchdog: heartbeat stalled past idle limit
 	ExitAbsTimeout  = 124 // absolute wall-clock limit exceeded
 )
 
