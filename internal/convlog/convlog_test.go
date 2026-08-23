@@ -1,6 +1,7 @@
 package convlog
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -391,6 +392,153 @@ func TestC13_QuotedSettingsMarkerIsIgnored(t *testing.T) {
 	got := ResolveEffectiveModel("", trPath, "", modelMap)
 	if got != "gemini-3.1-pro-high" {
 		t.Errorf("got %q, want %q", got, "gemini-3.1-pro-high")
+	}
+}
+
+// D1: 同一ツールが閾値超の回数連続呼び出し（途中に schedule あり）、成果物増えていない -> warnings に記録される
+func TestD1_StallDetected(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	// 17 calls of generate_image interleaved with 5 schedule calls
+	// start: 2026-08-23T01:00:19Z, end: 2026-08-23T01:25:18Z (diff: 1499s)
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	tEnd, _ := time.Parse(time.RFC3339, "2026-08-23T01:25:18Z")
+	totalSteps := 22 // 17 generate_image + 5 schedule
+	stepDuration := tEnd.Sub(t0) / time.Duration(totalSteps-1)
+
+	stepIdx := 1
+	for i := 0; i < 17; i++ {
+		curTime := t0.Add(time.Duration(stepIdx-1) * stepDuration).Format(time.RFC3339)
+		if i == 16 {
+			curTime = tEnd.Format(time.RFC3339)
+		}
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, stepIdx)
+		stepIdx++
+		if i < 5 {
+			curTime = t0.Add(time.Duration(stepIdx-1) * stepDuration).Format(time.RFC3339)
+			fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"schedule"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, stepIdx)
+			stepIdx++
+		}
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn == "" {
+		t.Fatalf("expected warning for stalled tool calls, got empty")
+	}
+	if !strings.Contains(warn, "generate_image") {
+		t.Errorf("expected warning to mention 'generate_image', got %q", warn)
+	}
+	if !strings.Contains(warn, "17") {
+		t.Errorf("expected warning to mention count '17', got %q", warn)
+	}
+	if !strings.Contains(warn, "1499") {
+		t.Errorf("expected warning to mention elapsed seconds '1499', got %q", warn)
+	}
+}
+
+// D2: 同一ツールが閾値未満の回数呼び出し -> 記録されない
+func TestD2_BelowThreshold(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 5; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning for below threshold calls, got %q", warn)
+	}
+}
+
+// D3: 同一ツールが閾値超だが途中で成果物が増えている -> 記録されない
+func TestD3_ProgressWithArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 17; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	artifacts := []string{"/path/to/image.png"}
+	warn := DetectToolStall(tp, artifacts, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning when artifacts exist, got %q", warn)
+	}
+}
+
+// D4: 別々のツールが閾値超の回数呼び出し -> 記録されない
+func TestD4_DifferentTools(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	tools := []string{"find_by_name", "read_file", "write_to_file"}
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 15; i++ {
+		tool := tools[i%len(tools)]
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"%s"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, tool, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning for alternating tools, got %q", warn)
+	}
+}
+
+// D5: 閾値の環境変数を変える -> 判定が変わる
+func TestD5_EnvironmentVariableThreshold(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 7; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	// Threshold 10 (default): no warning
+	warnDefault := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warnDefault != "" {
+		t.Errorf("expected no warning with threshold 10, got %q", warnDefault)
+	}
+
+	// Threshold 5 (custom): should warn
+	warnCustom := DetectToolStall(tp, []string{}, 5, time.Time{})
+	if warnCustom == "" {
+		t.Errorf("expected warning with threshold 5, got empty")
+	}
+}
+
+// D6: transcript が読めない -> 記録されずクラッシュしない
+func TestD6_UnreadableTranscript(t *testing.T) {
+	dir := t.TempDir()
+	missingPath := filepath.Join(dir, "nonexistent.jsonl")
+	warnMissing := DetectToolStall(missingPath, []string{}, 10, time.Time{})
+	if warnMissing != "" {
+		t.Errorf("expected no warning for nonexistent transcript, got %q", warnMissing)
+	}
+
+	brokenPath := filepath.Join(dir, "broken.jsonl")
+	_ = os.WriteFile(brokenPath, []byte("invalid json {{{\n{also bad}\n"), 0o600)
+	warnBroken := DetectToolStall(brokenPath, []string{}, 10, time.Time{})
+	if warnBroken != "" {
+		t.Errorf("expected no warning for broken transcript, got %q", warnBroken)
 	}
 }
 

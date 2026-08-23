@@ -440,6 +440,13 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		}
 	}
 
+	// Stalled tool call detection (record warning, do not stop execution).
+	if tp := convlog.TranscriptPath(paths.BrainDir, convID); tp != "" {
+		if warn := convlog.DetectToolStall(tp, r.Artifacts, cfg.ToolRepeatLimit, start); warn != "" {
+			r.Warnings = append(r.Warnings, warn)
+		}
+	}
+
 	if len(body) == 0 && rc == config.ExitOK && r.Error == nil {
 		r.Error = &emit.Error{
 			Reason: "empty_output",

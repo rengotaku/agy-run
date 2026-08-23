@@ -5,6 +5,7 @@ package convlog
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -287,6 +288,109 @@ func CheckArtifactMissing(toolCalls int, artifacts []string) *emit.Error {
 		}
 	}
 	return nil
+}
+
+// DetectToolStall checks for repeated tool calls without artifacts and returns a warning string if stalled.
+func DetectToolStall(transcriptPath string, artifacts []string, threshold int, since time.Time) string {
+	if len(artifacts) > 0 || threshold <= 0 || transcriptPath == "" {
+		return ""
+	}
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+
+	if !since.IsZero() {
+		since = since.Truncate(time.Second)
+	}
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	var (
+		currentTool  string
+		currentCount int
+		firstTime    time.Time
+		lastTime     time.Time
+
+		maxStallTool    string
+		maxStallCount   int
+		maxStallElapsed int
+	)
+
+	updateMaxStall := func() {
+		if currentCount >= threshold && currentCount > maxStallCount {
+			maxStallTool = currentTool
+			maxStallCount = currentCount
+			elapsed := 0
+			if !firstTime.IsZero() && !lastTime.IsZero() && !lastTime.Before(firstTime) {
+				elapsed = int(lastTime.Sub(firstTime).Seconds())
+			}
+			maxStallElapsed = elapsed
+		}
+	}
+
+	for sc.Scan() {
+		line := sc.Bytes()
+		var entry transcriptEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		var entryTime time.Time
+		if entry.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339Nano, entry.CreatedAt); err == nil {
+				entryTime = t
+			} else if t, err := time.Parse(time.RFC3339, entry.CreatedAt); err == nil {
+				entryTime = t
+			}
+		}
+
+		if !since.IsZero() {
+			if entryTime.IsZero() || entryTime.Before(since) {
+				continue
+			}
+		}
+
+		for _, tc := range entry.ToolCalls {
+			name := strings.TrimSpace(tc.Name)
+			if name == "" {
+				continue
+			}
+			if name == "schedule" {
+				continue
+			}
+
+			if currentTool == "" {
+				currentTool = name
+				currentCount = 1
+				firstTime = entryTime
+				lastTime = entryTime
+			} else if name == currentTool {
+				currentCount++
+				if !entryTime.IsZero() {
+					if firstTime.IsZero() {
+						firstTime = entryTime
+					}
+					lastTime = entryTime
+				}
+			} else {
+				updateMaxStall()
+				currentTool = name
+				currentCount = 1
+				firstTime = entryTime
+				lastTime = entryTime
+			}
+		}
+	}
+	updateMaxStall()
+
+	if maxStallCount >= threshold {
+		return fmt.Sprintf("同一ツール (%s) が %d 回連続呼び出しされ空転が検出されました (%d 秒間)。", maxStallTool, maxStallCount, maxStallElapsed)
+	}
+
+	return ""
 }
 
 

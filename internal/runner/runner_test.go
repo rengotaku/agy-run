@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -944,6 +945,43 @@ func TestAdd_BodyNonEmptyMultiple429Hits_WarningCountMatches(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected warning with レート制限シグネチャのヒット数: 3, got warnings: %v", r.Warnings)
+	}
+}
+
+// 追加テスト: TestRunner_ToolStallWarning / runner 全体で同一ツールの空転警告が warnings に追加されることの検証
+func TestRunner_ToolStallWarning(t *testing.T) {
+	home := newHome(t)
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", stubConv, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var sb strings.Builder
+	t0 := time.Now().Add(time.Second)
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
+
+	t.Setenv("STUB_BODY", "some output")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("AGY_RUN_TOOL_REPEAT_LIMIT", "10")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected stall warning in runner warnings, got warnings: %v", r.Warnings)
 	}
 }
 

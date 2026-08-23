@@ -30,6 +30,7 @@ const (
 	DefaultPollSec        = 20    // AGY_RUN_POLL
 	CooldownSec           = 30    // post-kill cooldown
 	DefaultMaxQuotaWait   = 14400 // AGY_RUN_MAX_QUOTA_WAIT (4h cap for --wait-quota)
+	DefaultToolRepeatLimit = 10    // AGY_RUN_TOOL_REPEAT_LIMIT
 
 	// DefaultIndexMaxBytes is the size (bytes) at which internal/index rotates
 	// index.jsonl into index.jsonl.1 (kept to 3 generations, oldest dropped).
@@ -54,11 +55,12 @@ type Config struct {
 	Sandbox      bool     // 既定 ON。--no-sandbox / AGY_RUN_SANDBOX=0 で無効化（bwrap isolation + net logging）
 	Prompt       string   // joined trailing args
 
-	MaxConcurrency int // AGY_RUN_MAX_CONCURRENCY (>=1)
-	IdleLimitSec   int // AGY_RUN_IDLE_LIMIT
-	AbsLimitSec    int // AGY_RUN_ABS_LIMIT
-	PollSec        int // AGY_RUN_POLL
-	MaxQuotaWait   int // AGY_RUN_MAX_QUOTA_WAIT (seconds; --wait-quota upper bound)
+	MaxConcurrency  int // AGY_RUN_MAX_CONCURRENCY (>=1)
+	IdleLimitSec    int // AGY_RUN_IDLE_LIMIT
+	AbsLimitSec     int // AGY_RUN_ABS_LIMIT
+	PollSec         int // AGY_RUN_POLL
+	MaxQuotaWait    int // AGY_RUN_MAX_QUOTA_WAIT (seconds; --wait-quota upper bound)
+	ToolRepeatLimit int // AGY_RUN_TOOL_REPEAT_LIMIT
 }
 
 // Env abstracts environment lookup for testability.
@@ -133,6 +135,10 @@ func Parse(argv []string, env Env) (cfg Config, wantHelp bool, err error) {
 		cfg.PollSec = 1
 	}
 	cfg.MaxQuotaWait = envInt(env, "AGY_RUN_MAX_QUOTA_WAIT", DefaultMaxQuotaWait)
+	cfg.ToolRepeatLimit = envInt(env, "AGY_RUN_TOOL_REPEAT_LIMIT", DefaultToolRepeatLimit)
+	if cfg.ToolRepeatLimit < 1 {
+		cfg.ToolRepeatLimit = 1
+	}
 
 	// Sandbox precedence: flag (--sandbox/--no-sandbox) > AGY_RUN_SANDBOX env >
 	// default (ON). AGY_RUN_SANDBOX=0/false disables, 1/true (or any other
