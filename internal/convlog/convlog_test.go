@@ -236,4 +236,137 @@ func TestA13_SameSecondToolCallIsCounted(t *testing.T) {
 	}
 }
 
+// C1: -m 指定あり -> 従来どおり指定値が記録される（既存の記録形式を変えない）
+func TestC1_ModelFlagSpecified(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "transcript.jsonl")
+	_ = os.WriteFile(trPath, []byte(`{"content":"The user changed setting `+"`"+`Model Selection`+"`"+` from None to Gemini 3.1 Pro (High)."}`), 0o644)
+	setPath := filepath.Join(dir, "settings.json")
+	_ = os.WriteFile(setPath, []byte(`{"model":"Gemini 3.1 Pro (High)"}`), 0o644)
+	modelMap := map[string]string{"Gemini 3.1 Pro (High)": "gemini-3.1-pro-high"}
+
+	got := ResolveEffectiveModel("gemini-3.6-flash-high", trPath, setPath, modelMap)
+	if got != "gemini-3.6-flash-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.6-flash-high")
+	}
+}
+
+// C2: -m なし、transcript あり -> kebab-case ID が記録される（実効モデルを追えるか）
+func TestC2_TranscriptModelSelectionNormalized(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "transcript.jsonl")
+	content := `{"content":"The user changed setting ` + "`" + `Model Selection` + "`" + ` from None to Gemini 3.6 Flash (High)."}` + "\n"
+	_ = os.WriteFile(trPath, []byte(content), 0o644)
+	setPath := filepath.Join(dir, "settings.json")
+	modelMap := map[string]string{"Gemini 3.6 Flash (High)": "gemini-3.6-flash-high"}
+
+	got := ResolveEffectiveModel("", trPath, setPath, modelMap)
+	if got != "gemini-3.6-flash-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.6-flash-high")
+	}
+}
+
+// C3: -m なし、transcript あり (対応表未登録) -> 表示名がそのまま記録される（正規化に失敗しても空文字を残さない）
+func TestC3_TranscriptModelSelectionUnregisteredDisplayName(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "transcript.jsonl")
+	content := `{"content":"The user changed setting ` + "`" + `Model Selection` + "`" + ` from None to Unknown Model (High)."}` + "\n"
+	_ = os.WriteFile(trPath, []byte(content), 0o644)
+	setPath := filepath.Join(dir, "settings.json")
+	modelMap := map[string]string{"Gemini 3.6 Flash (High)": "gemini-3.6-flash-high"}
+
+	got := ResolveEffectiveModel("", trPath, setPath, modelMap)
+	if got != "Unknown Model (High)" {
+		t.Errorf("got %q, want %q", got, "Unknown Model (High)")
+	}
+}
+
+// C4: -m なし、transcript なし、settings.json の値あり -> settings.json の値（正規化）が記録される（代替経路が効くか）
+func TestC4_SettingsJsonFallback(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "non_existent.jsonl")
+	setPath := filepath.Join(dir, "settings.json")
+	_ = os.WriteFile(setPath, []byte(`{"model":"Gemini 3.1 Pro (High)"}`), 0o644)
+	modelMap := map[string]string{"Gemini 3.1 Pro (High)": "gemini-3.1-pro-high"}
+
+	got := ResolveEffectiveModel("", trPath, setPath, modelMap)
+	if got != "gemini-3.1-pro-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.1-pro-high")
+	}
+}
+
+// C5: -m なし、transcript なし、settings.json なし -> "(unresolved)" が記録される（空文字を残さないか）
+func TestC5_UnresolvedFallback(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "non_existent.jsonl")
+	setPath := filepath.Join(dir, "non_existent.json")
+
+	got := ResolveEffectiveModel("", trPath, setPath, nil)
+	if got != UnresolvedModel {
+		t.Errorf("got %q, want %q", got, UnresolvedModel)
+	}
+}
+
+// C6: 解決処理が失敗するケース -> 実行そのものは成功し既定の代替値 "(unresolved)" が記録される（記録のための処理が本来の実行を妨げないか）
+func TestC6_ResolutionFailureSafety(t *testing.T) {
+	dir := t.TempDir()
+	// Pass a directory path as transcriptPath (os.Open will succeed or scan will fail/error)
+	trPath := dir
+	setPath := filepath.Join(dir, "invalid.json")
+	_ = os.WriteFile(setPath, []byte(`{invalid json`), 0o644)
+
+	got := ResolveEffectiveModel("", trPath, setPath, nil)
+	if got != UnresolvedModel {
+		t.Errorf("got %q, want %q", got, UnresolvedModel)
+	}
+}
+
+// 追加テスト: C7_NormalizeModelName_NilMap / modelMap が nil の場合の安全動作確認
+func TestC7_NormalizeModelName_NilMap(t *testing.T) {
+	got := NormalizeModelName("Gemini 3.6 Flash (High)", nil)
+	if got != "Gemini 3.6 Flash (High)" {
+		t.Errorf("got %q, want %q", got, "Gemini 3.6 Flash (High)")
+	}
+}
+
+// 追加テスト: C8_ExtractModelFromTranscript_MultipleChanges / 複数回の設定変更ログから最新モデルを取得することの確認
+func TestC8_ExtractModelFromTranscript_MultipleChanges(t *testing.T) {
+	dir := t.TempDir()
+	trPath := filepath.Join(dir, "transcript.jsonl")
+	line1 := `{"content":"The user changed setting ` + "`" + `Model Selection` + "`" + ` from None to Gemini 3.1 Pro (High)."}` + "\n"
+	line2 := `{"content":"The user changed setting ` + "`" + `Model Selection` + "`" + ` from Gemini 3.1 Pro (High) to Gemini 3.6 Flash (High)."}` + "\n"
+	_ = os.WriteFile(trPath, []byte(line1+line2), 0o644)
+
+	got := ExtractModelFromTranscript(trPath)
+	if got != "Gemini 3.6 Flash (High)" {
+		t.Errorf("got %q, want %q", got, "Gemini 3.6 Flash (High)")
+	}
+}
+
+// 追加テスト: C9_ExtractModelFromSettings_MalformedJson / 破損 JSON で空文字を返しパニックしないことの確認
+func TestC9_ExtractModelFromSettings_MalformedJson(t *testing.T) {
+	dir := t.TempDir()
+	setPath := filepath.Join(dir, "settings.json")
+	_ = os.WriteFile(setPath, []byte(`{invalid json`), 0o644)
+
+	got := ExtractModelFromSettings(setPath)
+	if got != "" {
+		t.Errorf("got %q, want empty string", got)
+	}
+}
+
+// 追加テスト: C10_NormalizeModelName_AlreadyID / 既に ID 形式の名称が渡された場合にモデルマップから正しく返されるかの確認
+func TestC10_NormalizeModelName_AlreadyID(t *testing.T) {
+	modelMap := map[string]string{
+		"Gemini 3.6 Flash (High)": "gemini-3.6-flash-high",
+		"gemini-3.6-flash-high":   "gemini-3.6-flash-high",
+	}
+	got := NormalizeModelName("gemini-3.6-flash-high", modelMap)
+	if got != "gemini-3.6-flash-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.6-flash-high")
+	}
+}
+
+
+
 

@@ -670,6 +670,54 @@ printf 'ok\n'
 	}
 }
 
+// 追加テスト: IndexEffectiveModelResolution / -m 未指定時に settings.json から実効モデルが index.jsonl に記録されるかの統合テスト
+func TestRunIndexEffectiveModelResolution(t *testing.T) {
+	home := t.TempDir()
+	stateDir := filepath.Join(home, "data", "agy-run")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := `#!/bin/sh
+if [ "$1" = "models" ]; then
+  printf 'gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n'
+  exit 0
+fi
+printf 'ok\n'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	settingsDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(settingsDir, "settings.json"), []byte(`{"model":"Gemini 3.1 Pro (High)"}`), 0o644)
+
+	t.Setenv("STUB_CONV", stubConv)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+
+	rc, _, _ := run(t, home, []string{"hello"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+
+	indexPath := filepath.Join(stateDir, "index.jsonl")
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatalf("failed to read index.jsonl: %v", err)
+	}
+	if !strings.Contains(string(data), `"model":"gemini-3.1-pro-high"`) {
+		t.Errorf("index content = %s, want model to be resolved as gemini-3.1-pro-high", string(data))
+	}
+}
+
+
 // A7: 本文ゼロ + ログに rate limit キーワード + 成果物ツール呼び出しあり ->
 // runner のエラー分類で rate_limited (exit 42) が優先され、artifact_missing に上書きされない
 func TestA7_RunRateLimitedTakesPrecedenceOverArtifactMissing(t *testing.T) {

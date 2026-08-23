@@ -17,7 +17,9 @@
 - **workspace 不一致の preflight 警告**: feature worktree から呼んだ差分が trusted workspace(main) に落ちる状況を検出し `warnings` に出力
 - **RUN_COMMAND 監査**: agy の build/test 失敗をログから拾い `run_command_failures` / `warnings` に出す（自己申告「テスト緑」の誤信防止）
 - **成果物欠落検知**: 成果物生成ツール（`generate_image`）を実行したのに artifacts が 0 件の場合は `artifact_missing` として失敗扱い（`exit 43`）
+- **実効モデルの記録**: `index.jsonl` の `model` フィールドには、`-m` 指定値のほか、`-m` 未指定時でも agy が実際に使用した実効モデル（transcript や `settings.json` から解決された ID、解決不能時は `(unresolved)`）を記録
 - **出力契約**: stdout=結果 JSON、stderr=人向けメタのみ
+
 
 ## 使い方
 
