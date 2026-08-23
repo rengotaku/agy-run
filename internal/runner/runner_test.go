@@ -838,13 +838,13 @@ func TestAdd_BodyNonEmptyMultiple429Hits_WarningCountMatches(t *testing.T) {
 	r := parseResult(t, out)
 	found := false
 	for _, w := range r.Warnings {
-		if strings.Contains(w, "429ヒット数: 3") {
+		if strings.Contains(w, "レート制限シグネチャのヒット数: 3") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected warning with 429ヒット数: 3, got warnings: %v", r.Warnings)
+		t.Errorf("expected warning with レート制限シグネチャのヒット数: 3, got warnings: %v", r.Warnings)
 	}
 }
 

@@ -415,7 +415,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 			rc = config.ExitRateLimited // contract: 42 = empty body + rate-limit signature, whatever agy's own exit code was.
 		} else {
 			r.Warnings = append(r.Warnings, fmt.Sprintf(
-				"本文は返っていますがログにレート制限の兆候があります (429ヒット数: %d)。exit_code は変更されていません。",
+				"本文は返っていますがログにレート制限の兆候があります (レート制限シグネチャのヒット数: %d)。exit_code は変更されていません。",
 				hits))
 		}
 	}
