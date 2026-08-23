@@ -125,6 +125,10 @@ func CountArtifactToolCalls(transcriptPath string, since time.Time) int {
 	}
 	defer func() { _ = f.Close() }()
 
+	if !since.IsZero() {
+		since = since.Truncate(time.Second)
+	}
+
 	count := 0
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)

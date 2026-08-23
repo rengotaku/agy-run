@@ -210,4 +210,30 @@ func TestA12_ContinuedConversationIgnoresPastToolCalls(t *testing.T) {
 	}
 }
 
+// A13: since が秒未満の端数を持つ場合でも、同じ秒の created_at を持つ呼び出しが正しくカウントされ artifact_missing が発火すること
+func TestA13_SameSecondToolCallIsCounted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	// since has fractional seconds (.700Z)
+	sinceTime := time.Date(2026, 8, 23, 1, 0, 6, 700000000, time.UTC)
+	// created_at is exact same second (2026-08-23T01:00:06Z)
+	createdAt := time.Date(2026, 8, 23, 1, 0, 6, 0, time.UTC).Format(time.RFC3339)
+
+	entry := `{"created_at":"` + createdAt + `","type":"PLANNER_RESPONSE","tool_calls":[{"name":"generate_image"}]}` + "\n"
+
+	if err := os.WriteFile(path, []byte(entry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	count := CountArtifactToolCalls(path, sinceTime)
+	if count != 1 {
+		t.Errorf("count = %d, want 1 (same second tool call should be counted)", count)
+	}
+	err := CheckArtifactMissing(count, []string{})
+	if err == nil || err.Reason != "artifact_missing" {
+		t.Errorf("expected artifact_missing error, got %+v", err)
+	}
+}
+
 
