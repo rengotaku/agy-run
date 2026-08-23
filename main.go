@@ -82,6 +82,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
       --wait-quota でログの "Resets in ..." を読み、リセットまで 1 回だけ待機して再試行
     - RUN_COMMAND 監査: agy の build/test 失敗をログから拾い run_command_failures /
       warnings に出す（agy の自己申告「テスト緑」の誤信を出力側から防ぐ）
+    - レート制限検出: 本文ゼロ時は exit 42 (rate_limited) とするが、本文非空時は exit code / error
+      を変えず warnings にヒット件数を記録する（調査タスク等での誤検知による中断を防ぐ）
     - 単一 JSON 出力: 実行結果を stdout に 1 個の JSON にまとめる（encoding/json で常にエスケープ）
 
 環境変数:
@@ -108,7 +110,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
       "body_file":            "本文の決定論的コピー先パス（純本文を読むならこのファイル）",
       "artifacts":            ["生成画像の絶対パス", ...],
       "model":                "実際に使用したモデル（-m 指定時）",
-      "warnings":             ["非致命の警告（workspace 不一致 / RUN_COMMAND 失敗）", ...],
+      "warnings":             ["非致命の警告（workspace 不一致 / RUN_COMMAND 失敗 / レート制限検出）", ...],
       "run_command_failures": 0,    // agy の build/test 失敗件数（>0 は自己申告要再検証）
       "net_log":              "/path/to/net-access.jsonl",  // sandbox 実行時のみ（既定 ON）
       "exit_code":            0,

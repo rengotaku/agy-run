@@ -704,3 +704,149 @@ func TestA7_RunRateLimitedTakesPrecedenceOverArtifactMissing(t *testing.T) {
 	}
 }
 
+// B1: 本文が非空、ログに 429 ヒットあり -> exit_code は変わらず、warnings にレート制限の記載が入る。error は nil のまま
+func TestB1_BodyNonEmptyWith429_ExitCodeUnchanged_WarnsRateLimit(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, errb := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil {
+		t.Errorf("error should be nil when body is non-empty, got %+v", r.Error)
+	}
+	if r.ExitCode != 0 {
+		t.Errorf("exit_code = %d, want 0", r.ExitCode)
+	}
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "レート制限") || strings.Contains(w, "429") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected rate-limit warning in r.Warnings, got %v", r.Warnings)
+	}
+	if !strings.Contains(errb, "warning:") {
+		t.Errorf("expected warning on stderr, got %q", errb)
+	}
+}
+
+// B2: 本文がゼロ、ログに 429 ヒットあり -> 従来どおり error.reason = "rate_limited" / exit 42
+func TestB2_BodyEmptyWith429_ExitCode42RateLimited(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want 42", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("result missing rate_limited error: %+v", r)
+	}
+	if r.ExitCode != config.ExitRateLimited {
+		t.Errorf("result exit_code = %d, want 42", r.ExitCode)
+	}
+}
+
+// B3: 本文が非空、ログに 429 ヒットなし -> warnings にレート制限の行が増えない
+func TestB3_BodyNonEmptyNo429_NoRateLimitWarning(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_LOG_EXTRA", "all good")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "レート制限") || strings.Contains(w, "429") {
+			t.Errorf("unexpected rate-limit warning in r.Warnings: %v", w)
+		}
+	}
+}
+
+// B4: 本文が非空、ログが読めない -> 警告は出ず、実行結果は従来どおり
+func TestB4_BodyNonEmptyUnreadableLog_NoRateLimitWarning(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "レート制限") || strings.Contains(w, "429") {
+			t.Errorf("unexpected rate-limit warning when log has no 429: %v", w)
+		}
+	}
+}
+
+// B5: 本文が非空、429 ヒットあり、既に別の warning がある -> 既存の warning が消えず、レート制限の行が追加される
+func TestB5_BodyNonEmptyWith429_ExistingWarningPreserved(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_LOG_EXTRA", "error executing cascade step: CORTEX_STEP_TYPE_RUN_COMMAND: failed\nHTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	hasExisting := false
+	hasRateLimit := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "RUN_COMMAND") {
+			hasExisting = true
+		}
+		if strings.Contains(w, "レート制限") || strings.Contains(w, "429") {
+			hasRateLimit = true
+		}
+	}
+	if !hasExisting {
+		t.Errorf("existing warning (RUN_COMMAND) was lost: %v", r.Warnings)
+	}
+	if !hasRateLimit {
+		t.Errorf("rate-limit warning was not added: %v", r.Warnings)
+	}
+}
+
+// 追加テスト: TestAdd_BodyNonEmptyMultiple429Hits_WarningCountMatches / 複数429ヒット時にヒット件数が警告文に正しく入るかの検証
+func TestAdd_BodyNonEmptyMultiple429Hits_WarningCountMatches(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "hello from agy")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted\nHTTP 429 resource_exhausted\nHTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "429ヒット数: 3") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning with 429ヒット数: 3, got warnings: %v", r.Warnings)
+	}
+}
+
+
+
