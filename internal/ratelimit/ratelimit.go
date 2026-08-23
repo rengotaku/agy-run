@@ -15,7 +15,7 @@ import (
 // sigRe matches the rate-limit / overload signatures in the agy log
 // (case-insensitive), mirroring the bash grep pattern
 // '429|overloaded|rate.?limit|resource_exhausted|quota'.
-var sigRe = regexp.MustCompile(`(?i)429|overloaded|rate.?limit|resource_exhausted|quota`)
+var sigRe = regexp.MustCompile(`(?i)\b429\b|overloaded|rate.?limit|resource_exhausted|\bquota\b`)
 
 // resetRe captures the agy quota-reset hint, e.g. "Resets in 3h0m10s" or
 // "Resets in 45m 30s". Hours/minutes/seconds are each optional.
