@@ -380,6 +380,22 @@ func TestC11_RealTranscriptMarkerFormat(t *testing.T) {
 	}
 }
 
+// 回帰テスト: TestC13_QuotedSettingsMarkerIsIgnored / 会話中の引用でモデル記録が汚染されないこと
+func TestC13_QuotedSettingsMarkerIsIgnored(t *testing.T) {
+	trPath := "testdata/transcript_quoted_marker.jsonl"
+	modelMap := map[string]string{
+		"Gemini 3.1 Pro (High)": "gemini-3.1-pro-high",
+		"Gemini 3.6 Flash (Low)": "gemini-3.6-flash-low",
+	}
+
+	got := ResolveEffectiveModel("", trPath, "", modelMap)
+	if got != "gemini-3.1-pro-high" {
+		t.Errorf("got %q, want %q", got, "gemini-3.1-pro-high")
+	}
+}
+
+
+
 
 
 
