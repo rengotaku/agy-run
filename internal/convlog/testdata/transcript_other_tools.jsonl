@@ -1,0 +1,2 @@
+{"step_index":1,"type":"USER_INPUT","content":"Run a bash command"}
+{"step_index":2,"type":"PLANNER_RESPONSE","content":"Running command","tool_calls":[{"name":"run_command","args":{"command":"ls -la"}},{"name":"view_file","args":{"path":"main.go"}}]}

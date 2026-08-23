@@ -669,3 +669,38 @@ printf 'ok\n'
 		t.Errorf("legacy model format should not error: %+v", r.Error)
 	}
 }
+
+// A7: 本文ゼロ + ログに rate limit キーワード + 成果物ツール呼び出しあり ->
+// runner のエラー分類で rate_limited (exit 42) が優先され、artifact_missing に上書きされない
+func TestA7_RunRateLimitedTakesPrecedenceOverArtifactMissing(t *testing.T) {
+	home := newHome(t)
+	// 本文ゼロ + rate limit ログ
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted")
+	t.Setenv("STUB_EXIT", "0")
+
+	// transcript に generate_image の tool_calls がある状態を仮定
+	// (brainDir 以下に transcript.jsonl を作成)
+	convDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", stubConv, ".system_generated", "logs")
+	if err := os.MkdirAll(convDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcriptContent := `{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"generate_image","args":{}}]}` + "\n"
+	if err := os.WriteFile(filepath.Join(convDir, "transcript.jsonl"), []byte(transcriptContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rc, out, _ := run(t, home, []string{"generate image prompt"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want 42 (rate_limited must take precedence over artifact_missing)", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Errorf("result missing rate_limited error (got reason %q): %+v",
+			r.Error.Reason, r.Error)
+	}
+	if r.ExitCode != config.ExitRateLimited {
+		t.Errorf("result exit_code = %d, want 42", r.ExitCode)
+	}
+}
+

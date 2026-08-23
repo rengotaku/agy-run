@@ -4,6 +4,7 @@ package convlog
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/rengotaku/agy-run/internal/emit"
 )
 
 var (
@@ -96,3 +99,70 @@ func NewImageArtifacts(brainDir, convID string, since time.Time) []string {
 	sort.Strings(out)
 	return out
 }
+
+// ArtifactTools holds the set of tool names that generate artifacts.
+var ArtifactTools = map[string]bool{
+	"generate_image": true,
+}
+
+type transcriptEntry struct {
+	CreatedAt string `json:"created_at"`
+	ToolCalls []struct {
+		Name string `json:"name"`
+	} `json:"tool_calls"`
+}
+
+// CountArtifactToolCalls scans a transcript file and counts calls to artifact-generating tools
+// occurring at or after 'since'. If 'since' is zero, all calls are counted.
+// Returns 0 if transcriptPath is empty, unreadable, or contains no matching artifact tool calls.
+func CountArtifactToolCalls(transcriptPath string, since time.Time) int {
+	if transcriptPath == "" {
+		return 0
+	}
+	f, err := os.Open(transcriptPath)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = f.Close() }()
+
+	count := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	for sc.Scan() {
+		line := sc.Bytes()
+		var entry transcriptEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+		if !since.IsZero() {
+			if entry.CreatedAt == "" {
+				continue
+			}
+			t, err := time.Parse(time.RFC3339Nano, entry.CreatedAt)
+			if err != nil || t.Before(since) {
+				continue
+			}
+		}
+		for _, tc := range entry.ToolCalls {
+			if ArtifactTools[tc.Name] {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// CheckArtifactMissing evaluates if artifact-generating tools were called but no artifacts were produced.
+// Returns an *emit.Error with reason "artifact_missing" if toolCalls > 0 and len(artifacts) == 0, nil otherwise.
+func CheckArtifactMissing(toolCalls int, artifacts []string) *emit.Error {
+	if toolCalls > 0 && len(artifacts) == 0 {
+		return &emit.Error{
+			Reason: "artifact_missing",
+			Hint:   "成果物生成ツールが実行されましたが成果物が生成されませんでした。",
+		}
+	}
+	return nil
+}
+
+

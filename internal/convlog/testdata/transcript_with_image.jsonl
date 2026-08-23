@@ -1,0 +1,2 @@
+{"step_index":1,"type":"USER_INPUT","content":"Generate an image of a cat"}
+{"step_index":2,"type":"PLANNER_RESPONSE","content":"I will generate an image.","tool_calls":[{"name":"generate_image","args":{"prompt":"a cute cat"}}]}

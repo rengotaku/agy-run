@@ -1,0 +1,3 @@
+{"step_index":1,"type":"USER_INPUT","content":"Generate an image"}
+{invalid json line here...
+{"step_index":2,"type":"PLANNER_RESPONSE","content":"Generating","tool_calls":[{"name":"generate_image","args":{"prompt":"dog"}}]}

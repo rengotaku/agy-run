@@ -8,7 +8,7 @@
 // the right tools for the job.
 //
 // Exit codes: 0 success / 2 usage / 4 slot lock timeout / 42 rate_limited /
-// 44 idle stall / 124 absolute timeout / else agy's own code.
+// 43 artifact_missing / 44 idle stall / 124 absolute timeout / else agy's own code.
 package main
 
 import (
@@ -123,8 +123,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
 
 exit code:
     0=成功 / 2=引数エラー / 4=スロットロック待ちタイムアウト /
-    42=レート制限（本文ゼロ＋ログに 429）/ 44=アイドルストール（heartbeat 途絶）/
-    124=絶対上限タイムアウト / その他=agy 自身の exit code
+    42=レート制限（本文ゼロ＋ログに 429）/ 43=成果物生成失敗（成果物ツール呼出あり＋artifactsゼロ）/
+    44=アイドルストール（heartbeat 途絶）/ 124=絶対上限タイムアウト / その他=agy 自身の exit code
 `
 
 func main() {

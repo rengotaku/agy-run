@@ -405,36 +405,36 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 			len(fails)))
 	}
 
-	// Rate-limit / empty-output / generic-failure classification.
-	//
-	// This used to only look at rc==0 (agy exited "clean" but produced no
-	// body), on the assumption that agy's own quota-exceeded path always
-	// exits 0. Real-world runs showed a second quota shape: agy exits
-	// **non-zero** ("Individual quota reached ... Resets in ...") with an
-	// empty body. That path used to leave error.reason unset entirely — no
-	// exit-42 normalization, so the -m fallback chain and --wait-quota never
-	// fired on it (issue #22 follow-up: this was the dominant shape behind
-	// the exit-1 spike that motivated this issue). So the log signature scan
-	// now runs whenever the body is empty, regardless of rc; any rc!=0 that
-	// still has no Reason afterwards (a non-rate-limit agy failure, with or
-	// without partial body) falls back to the generic "agy_error" so
-	// index.jsonl never records an undiagnosable blank for a failing run.
+	// Rate-limit / artifact-missing / empty-output / generic-failure classification.
 	if len(body) == 0 {
 		hits := ratelimit.CountHits(logFile)
-		switch {
-		case hits > 0:
+		if hits > 0 {
 			r.Error = &emit.Error{
 				Reason: "rate_limited", LogRatelimitHits: hits,
 				Hint: "agyの5時間枠/レート上限の可能性。-m にフォールバック候補を並べるか --wait-quota でリセット待機を検討。",
 			}
 			rc = config.ExitRateLimited // contract: 42 = empty body + rate-limit signature, whatever agy's own exit code was.
-		case rc == config.ExitOK:
-			r.Error = &emit.Error{
-				Reason: "empty_output",
-				Note:   "本文ゼロ。stderr のログ末尾を確認（rc は変更しない）。",
+		}
+	}
+
+	// Artifact-missing classification (only if not rate_limited).
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		if tp := convlog.TranscriptPath(paths.BrainDir, convID); tp != "" {
+			toolCalls := convlog.CountArtifactToolCalls(tp, start)
+			if err := convlog.CheckArtifactMissing(toolCalls, r.Artifacts); err != nil {
+				r.Error = err
+				rc = config.ExitArtifactMissing
 			}
 		}
 	}
+
+	if len(body) == 0 && rc == config.ExitOK && r.Error == nil {
+		r.Error = &emit.Error{
+			Reason: "empty_output",
+			Note:   "本文ゼロ。stderr のログ末尾を確認（rc は変更しない）。",
+		}
+	}
+
 	if rc != config.ExitOK && r.Error == nil {
 		r.Error = &emit.Error{Reason: "agy_error"}
 	}
