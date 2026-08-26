@@ -53,6 +53,7 @@ type Options struct {
 //	--ro-bind /usr /usr (+ /bin /lib /lib64 /sbin as --symlink or --ro-bind)
 //	--proc /proc --dev /dev --tmpfs /tmp
 //	--ro-bind /etc/ssl, --ro-bind-try resolv.conf/hosts/passwd/group/machine-id
+//	--ro-bind-try /etc/localtime /etc/timezone   (中と外でタイムゾーンを揃える)
 //	--ro-bind ~/.local ~/.local            (agy / agy-run binaries)
 //	--bind ~/.gemini ~/.gemini              (auth / conversations / brain / slots, rw required)
 //	--ro-bind <resolved symlink targets under ~/.gemini/config>
@@ -90,7 +91,14 @@ func BuildArgs(opt Options) []string {
 	if info, err := os.Stat("/etc/ssl"); err == nil && info.IsDir() {
 		add("--ro-bind", "/etc/ssl", "/etc/ssl")
 	}
-	for _, f := range []string{"/etc/resolv.conf", "/etc/hosts", "/etc/passwd", "/etc/group", "/etc/machine-id"} {
+	// /etc/localtime と /etc/timezone を入れないと sandbox の中だけ UTC になる。
+	// --clearenv で TZ が落ちるうえ、ゾーン情報の実体 (/usr/share/zoneinfo) は bind
+	// されているのにそれを指す /etc/localtime が無く、glibc も Node も UTC へ倒れる。
+	// 中と外で時刻がずれると、sandbox で緑になったテストがホストで落ちる (issue #48)。
+	for _, f := range []string{
+		"/etc/resolv.conf", "/etc/hosts", "/etc/passwd", "/etc/group", "/etc/machine-id",
+		"/etc/localtime", "/etc/timezone",
+	} {
 		add("--ro-bind-try", f, f)
 	}
 
