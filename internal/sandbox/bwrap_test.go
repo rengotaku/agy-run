@@ -42,6 +42,8 @@ func TestBuildArgsStaticSystemFlags(t *testing.T) {
 		{"--ro-bind-try", "/etc/passwd", "/etc/passwd"},
 		{"--ro-bind-try", "/etc/group", "/etc/group"},
 		{"--ro-bind-try", "/etc/machine-id", "/etc/machine-id"},
+		{"--ro-bind-try", "/etc/localtime", "/etc/localtime"},
+		{"--ro-bind-try", "/etc/timezone", "/etc/timezone"},
 		{"--clearenv"},
 	} {
 		if !containsSeq(args, want) {
