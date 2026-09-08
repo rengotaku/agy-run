@@ -152,3 +152,59 @@ func TestRunAbsTimeout(t *testing.T) {
 		t.Error("kill not called")
 	}
 }
+
+// Case 4: Watcher.Probe が None 以外を返したら kill してその Reason を返す
+// 前提: Watcher{Idle: 0, Abs: 0, Poll: 10ms, Probe: <1 回目は None、2 回目以降 AuthRequired を返す関数>}。kill は呼び出し回数を数える
+// 手順: Run(ctx, kill)
+// 期待挙動: 戻り値 AuthRequired、kill が 1 回呼ばれる。同じ Watcher で Probe: nil にすると ctx cancel まで None（既存挙動）
+// 検証観点: Probe の配線と、nil 時の後方互換
+func TestCase4_WatcherProbe(t *testing.T) {
+	var probeCalls atomic.Int32
+	probe := func() Reason {
+		if probeCalls.Add(1) == 1 {
+			return None
+		}
+		return AuthRequired
+	}
+
+	var killed atomic.Int32
+	w := Watcher{
+		Idle:  0,
+		Abs:   0,
+		Poll:  10 * time.Millisecond,
+		Probe: probe,
+	}
+
+	got := w.Run(context.Background(), func() { killed.Add(1) })
+	if got != AuthRequired {
+		t.Fatalf("Run reason = %v, want AuthRequired", got)
+	}
+	if killed.Load() != 1 {
+		t.Fatalf("kill called %d times, want 1", killed.Load())
+	}
+
+	// 同じ Watcher で Probe: nil にすると ctx cancel まで None（既存挙動）
+	ctx, cancel := context.WithCancel(context.Background())
+	var killedNil atomic.Int32
+	wNil := Watcher{
+		Idle:  0,
+		Abs:   0,
+		Poll:  10 * time.Millisecond,
+		Probe: nil,
+	}
+	done := make(chan Reason, 1)
+	go func() {
+		done <- wNil.Run(ctx, func() { killedNil.Add(1) })
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+
+	gotNil := <-done
+	if gotNil != None {
+		t.Fatalf("Run with nil Probe reason = %v, want None", gotNil)
+	}
+	if killedNil.Load() != 0 {
+		t.Fatalf("kill called %d times with nil Probe, want 0", killedNil.Load())
+	}
+}

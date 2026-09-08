@@ -29,6 +29,8 @@ const (
 	Stall
 	// AbsTimeout means total elapsed exceeded the absolute limit (exit 124).
 	AbsTimeout
+	// AuthRequired means interactive OAuth was triggered while non-interactive (exit 45).
+	AuthRequired
 )
 
 // Clock abstracts time for testing.
@@ -48,6 +50,7 @@ type Watcher struct {
 	Poll  time.Duration       // polling interval
 	Paths func() []string     // current heartbeat file paths (may grow as conv id resolves)
 	Clock Clock               // injected clock (nil -> real time)
+	Probe func() Reason       // optional per-poll probe; returns non-None Reason to kill early
 }
 
 // Run blocks until ctx is cancelled (the process exited on its own) or a limit
@@ -71,6 +74,12 @@ func (w Watcher) Run(ctx context.Context, kill func()) Reason {
 		case <-ctx.Done():
 			return None
 		case <-ticker.C:
+			if w.Probe != nil {
+				if r := w.Probe(); r != None {
+					kill()
+					return r
+				}
+			}
 			if mt, ok := latestMTime(w.paths()); ok && mt.After(lastActive) {
 				lastActive = mt
 			}

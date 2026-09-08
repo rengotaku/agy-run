@@ -7,6 +7,7 @@
 | パッケージ / ファイル | 担当機能 |
 | --- | --- |
 | `main.go` | エントリポイント。CLI引数と環境変数のパース、ヘルプ表示、ホームディレクトリ取得、`runner.Run` の呼び出し、exit code によるプロセス終了の制御。 |
+| `internal/authreq` | 非対話 print mode 中に agy が interactive OAuth に遷移したことをログから検出。 |
 | `internal/config` | CLIフラグ（getopts互換）と環境変数の解析、Config構造体の構築、プログラム全体の exit code 定数および各種デフォルト値の定義。 |
 | `internal/convlog` | ログファイルからの会話ID抽出、`transcript.jsonl` や `settings.json` からの実効モデル解析、成果物ツール呼び出し回数のカウント、新規画像成果物の検出、同一ツール連続呼び出しによる空転（tool stall）検出。 |
 | `internal/emit` | stdout に出力する単一の JSON オブジェクト (`Result`, `Error`) のエンコードと、stderr への人向け診断メッセージ出力の制御。 |
@@ -16,7 +17,7 @@
 | `internal/runner` | 全体の実行制御。起動元プロセスグループからの切り離し、スロット取得、クールダウン処理、bwrap / netlog の準備、agy プロセスの起動と watchdog 監視、エラー判定と分類、フォールバック/クォータ待機ループ、結果の emit と index 追記の統括。 |
 | `internal/sandbox` | `bwrap` (Bubblewrap) によるファイルシステム隔離引数の構築、`GH_TOKEN` のパイプ経由注入、および HTTP(S) 通信を全記録するローカルフォワードプロキシ (`Proxy`) の提供。 |
 | `internal/slot` | スロットごとの flock ファイル (`.agy-run.slot.N`) による有界並列実行セマフォの制御とロック取得待ち処理。 |
-| `internal/watchdog` | アイドルタイムアウト (`AGY_RUN_IDLE_LIMIT`) と絶対上限タイムアウト (`AGY_RUN_ABS_LIMIT`) による 2 段階のプロセスキルフラグの監視。 |
+| `internal/watchdog` | アイドルタイムアウト (`AGY_RUN_IDLE_LIMIT`) と絶対上限タイムアウト (`AGY_RUN_ABS_LIMIT`) による 2 段階のプロセスキルフラグの監視および `Probe` による早期キル判定。 |
 | `internal/workspace` | agy の `settings.json` 内 `trustedWorkspaces` を読み取り、カレントディレクトリが非 trusted で兄弟 worktree が trusted の場合に発生する差分のずれを警告。 |
 
 ## 2. 1 回の実行の流れ
@@ -36,11 +37,11 @@
 6. サンドボックスとプロキシの起動
    `internal/sandbox` パッケージが `--sandbox` 設定時（既定ON）に `net-access.jsonl` を開き、ローカルプロキシを起動して `bwrap` 引数を生成する。`GH_TOKEN` はパイプ経由でサンドボックス内部へ安全に渡される。
 7. agy プロセスの起動と監視
-   `internal/runner` パッケージが `bwrap`（または直接 `agy`）を起動し、標準出力を一時ファイルにキャプチャする。同時に `internal/watchdog` パッケージの監視ゴルーチンが動作し、ログ・本文・`transcript.jsonl` の更新日時を定期的に判定する。タイムアウト発生時はプロセスグループ全体を SIGKILL で停止する。
+   `internal/runner` パッケージが `bwrap`（または直接 `agy`）を起動し、標準出力を一時ファイルにキャプチャする。同時に `internal/watchdog` パッケージの監視ゴルーチンが動作し、ログ・本文・`transcript.jsonl` の更新日時を定期的に判定する。また `Probe` により非対話中の interactive OAuth 遷移（本文 0 バイトかつ一致行あり）を早期検知する。タイムアウトや認証要求の発生時はプロセスグループ全体を SIGKILL で停止する。
 8. 結果の収集とログ解析
    `internal/convlog` パッケージが会話 ID、新規生成画像、実効モデル、ツール空転を判定する。`internal/runcmd` パッケージが build/test の失敗行をスキャンする。`internal/ratelimit` パッケージがレート制限ヒット数とリセット時間を抽出する。`internal/workspace` パッケージが作業ツリーの不一致警告を生成する。
 9. 失敗の分類と再試行制御
-   `internal/runner` パッケージが規定の優先順位に従ってエラー理由と exit code を決定する。`rate_limited` の場合は、`-m` の次候補モデルへの切替や `--wait-quota` による待機・再試行ループを実行する。
+   `internal/runner` パッケージが規定の優先順位に従ってエラー理由と exit code を決定する（watchdog 判定の直後に自力終了時の `auth_required` 判定、続いて `rate_limited`、`artifact_missing` 等）。`rate_limited` の場合は、`-m` の次候補モデルへの切替や `--wait-quota` による待機・再試行ループを実行する（`auth_required` はモデル切替を行わない）。
 10. 出力とインデックスへの記録
     `internal/index` パッケージが実行レコードを `index.jsonl` へ追記する（必要に応じて非ブロッキング flock によるファイルローテーションを実施）。最後に `internal/emit` パッケージが stdout に単一の JSON オブジェクトを出力する。
 
@@ -93,6 +94,7 @@
 | `ExitRateLimited` | 42 | agy のログ内にレート制限/過負荷のシグネチャが存在し、かつ本文 (`body`) が 0 バイトの場合。 |
 | `ExitArtifactMissing` | 43 | `rate_limited` でない場合において、`transcript.jsonl` 上で成果物生成ツール (`generate_image`) の呼び出し記録があるにもかかわらず、成果物ファイルが 0 件の場合。 |
 | `ExitStall` | 44 | アイドル watchdog が判定。ハートビート (ログ・本文・`transcript.jsonl` の最新 mtime) の更新が `AGY_RUN_IDLE_LIMIT` 秒間途絶えた場合。 |
+| `ExitAuthRequired` | 45 | 非対話 print mode 中に agy が interactive OAuth を要求（一致行あり）かつ本文が 0 バイトの場合。実行中の watchdog kill、またはプロセス終了後の分類で発生。 |
 | `ExitAbsTimeout` | 124 | 絶対 watchdog が判定。実行開始からの経過時間が `AGY_RUN_ABS_LIMIT` 秒を超過した場合。 |
 | (agyのexit code) | その他 | agy プロセスが自発的に返した終了コード（137等のシグナル終了含む）。 |
 
@@ -100,15 +102,17 @@
 
 `internal/runner/runner.go` の `attempt` 関数におけるエラー分類および判定の実行順序。
 
-1. Watchdog 強制終了判定 (`Stall` / `AbsTimeout`)
-   `watchdog.Reason` が `Stall` の場合は `ExitStall` (44), `Reason: "stall"`。`AbsTimeout` の場合は `ExitAbsTimeout` (124), `Reason: "timeout"` とし、ただちに処理を復帰する。
-2. レート制限判定 (`rate_limited`)
-   ログ内に `429|overloaded|rate.?limit|resource_exhausted|quota` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitRateLimited` (42), `Reason: "rate_limited"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` にヒット件数を記録する。
-3. 成果物生成失敗判定 (`artifact_missing`)
-   エラーが未設定または `rate_limited` でない場合に判定する。`transcript.jsonl` を解析し、実行開始時刻以降の成果物生成ツール (`generate_image`) 呼び出し数が 1 以上で、かつ検出成果物数が 0 の場合に `rc = ExitArtifactMissing` (43), `Reason: "artifact_missing"` を設定する。
-4. 空出力判定 (`empty_output`)
+1. Watchdog 強制終了判定 (`Stall` / `AbsTimeout` / `AuthRequired`)
+   `watchdog.Reason` が `Stall` の場合は `ExitStall` (44), `Reason: "stall"`。`AbsTimeout` の場合は `ExitAbsTimeout` (124), `Reason: "timeout"`。`AuthRequired` の場合は `ExitAuthRequired` (45), `Reason: "auth_required"` とし、ただちに処理を復帰する。
+2. 認証要求判定 (`auth_required`)
+   ログ内に `printmode\.go:\d+\] Print mode: triggering interactive OAuth$` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitAuthRequired` (45), `Reason: "auth_required"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` に記録する。
+3. レート制限判定 (`rate_limited`)
+   エラーが未設定の場合に判定する。ログ内に `429|overloaded|rate.?limit|resource_exhausted|quota` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitRateLimited` (42), `Reason: "rate_limited"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` にヒット件数を記録する。
+4. 成果物生成失敗判定 (`artifact_missing`)
+   エラーが未設定の場合に判定する。`transcript.jsonl` を解析し、実行開始時刻以降の成果物生成ツール (`generate_image`) 呼び出し数が 1 以上で、かつ検出成果物数が 0 の場合に `rc = ExitArtifactMissing` (43), `Reason: "artifact_missing"` を設定する。
+5. 空出力判定 (`empty_output`)
    本文が 0 バイト、`rc == ExitOK` (0)、かつエラーが未設定の場合に `Reason: "empty_output"` を設定する。終了コード (`rc`) は 0 のまま維持する。
-5. 汎用エラー判定 (`agy_error`)
+6. 汎用エラー判定 (`agy_error`)
    `rc != ExitOK` (0) かつエラーが未設定の場合に `Reason: "agy_error"` を設定する。
 
 ## 6. transcript を読む機能 (internal/convlog)
@@ -176,6 +180,7 @@
 
 | テストファイル | 防衛・検証対象 |
 | --- | --- |
+| `internal/authreq/authreq_test.go` | 非対話時の interactive OAuth 要求行の検出、ソース位置タグなし文字列の誤検知防止、ログ未存在時の安全性を保障。 |
 | `internal/config/config_test.go` | 引数パース、単位なし秒数補完、フォールバックモデル一覧展開、サンドボックス優先度（フラグ > 環境変数 > 既定）の互換性を保障。 |
 | `internal/convlog/convlog_test.go` | 会話ID抽出優先度、実効モデル決定順序、成果物欠損判定 (`artifact_missing`)、継続実行時の時刻フィルタリング、ツール空転判定を保障。 |
 | `internal/emit/emit_test.go` | stdout に出力される単一 JSON オブジェクトの構造およびフォーマット契約を保障。 |

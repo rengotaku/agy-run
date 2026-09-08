@@ -14,6 +14,7 @@ import (
 
 	"github.com/rengotaku/agy-run/internal/config"
 	"github.com/rengotaku/agy-run/internal/emit"
+	"github.com/rengotaku/agy-run/internal/watchdog"
 )
 
 // parseResult decodes the single JSON result object agy-run writes to stdout.
@@ -1099,6 +1100,216 @@ func TestE10(t *testing.T) {
 		t.Errorf("TestE10: should not be rate_limited, got %+v", r.Error)
 	}
 }
+
+// Case 5: 実行中に一致行 + 本文 0 バイトなら kill して exit 45
+// 前提: newHome の stub agy。STUB_LOG_EXTRA = fixture 行、STUB_BODY 未設定（空）、STUB_SLEEP=10、AGY_RUN_POLL=1、AGY_RUN_IDLE_LIMIT=6
+// 手順: run(t, home, ["long task"]) を実行し所要時間を測る
+// 期待挙動: rc 45。結果 JSON の error.reason == "auth_required"、error.detail に triggering interactive OAuth を含む、error.hint に excludedCommands を含む。所要時間が 5 秒未満（idle limit 6 秒より前に止まった＝stall ではなく Probe で止まった証拠）。kill stamp（.agy-run.last-kill）が作られる。index.jsonl に "error_class":"auth_required" と "exit_code":45
+// 検証観点: 実行中検知が stall より先に効くこと。停止経路が stall と同じ後始末（kill stamp）を通ること
+func TestCase5_RunWatchdogKillsAuthRequired(t *testing.T) {
+	home := newHome(t)
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_LOG_EXTRA", fixture)
+	// STUB_BODY 未設定（空）
+	t.Setenv("STUB_SLEEP", "10")
+	t.Setenv("AGY_RUN_POLL", "1")
+	t.Setenv("AGY_RUN_IDLE_LIMIT", "6")
+
+	t0 := time.Now()
+	rc, out, _ := run(t, home, []string{"long task"})
+	elapsed := time.Since(t0)
+
+	if rc != config.ExitAuthRequired {
+		t.Fatalf("rc = %d, want %d (ExitAuthRequired)", rc, config.ExitAuthRequired)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "auth_required" {
+		t.Fatalf("expected auth_required error, got %+v", r.Error)
+	}
+	if !strings.Contains(r.Error.Detail, "triggering interactive OAuth") {
+		t.Errorf("error.detail = %q, want containing %q", r.Error.Detail, "triggering interactive OAuth")
+	}
+	if !strings.Contains(r.Error.Hint, "excludedCommands") {
+		t.Errorf("error.hint = %q, want containing %q", r.Error.Hint, "excludedCommands")
+	}
+	if elapsed >= 5*time.Second {
+		t.Errorf("elapsed = %v, want < 5s (Probe stopped before 6s idle limit)", elapsed)
+	}
+
+	killStamp := filepath.Join(home, ".gemini", "antigravity-cli", ".agy-run.last-kill")
+	if _, err := os.Stat(killStamp); err != nil {
+		t.Errorf("kill stamp %s not created: %v", killStamp, err)
+	}
+
+	idxFile := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idxFile)
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	idxStr := string(data)
+	if !strings.Contains(idxStr, `"error_class":"auth_required"`) {
+		t.Errorf("index.jsonl does not contain error_class:auth_required: %s", idxStr)
+	}
+	if !strings.Contains(idxStr, `"exit_code":45`) {
+		t.Errorf("index.jsonl does not contain exit_code:45: %s", idxStr)
+	}
+}
+
+// Case 6: agy が自力終了した後の分類でも auth_required になる
+// 前提: STUB_LOG_EXTRA = fixture 行、STUB_BODY 空、STUB_EXIT=1、STUB_SLEEP 未設定
+// 手順: run(t, home, ["x"])
+// 期待挙動: rc 45、error.reason == "auth_required"（agy_error ではない）
+// 検証観点: print-timeout 等で agy が先に死んだケースでも分類が揃うこと
+func TestCase6_RunPostExitAuthRequired(t *testing.T) {
+	home := newHome(t)
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_LOG_EXTRA", fixture)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "1")
+	// STUB_SLEEP 未設定
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitAuthRequired {
+		t.Fatalf("rc = %d, want %d (ExitAuthRequired)", rc, config.ExitAuthRequired)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "auth_required" {
+		t.Fatalf("expected auth_required error, got %+v", r.Error)
+	}
+}
+
+// Case 7: 本文が非空なら kill も分類変更もせず warnings に載せる
+// 前提: STUB_LOG_EXTRA = fixture 行、STUB_BODY="answer"、STUB_EXIT=0
+// 手順: run(t, home, ["x"])
+// 期待挙動: rc 0、error == nil、warnings のいずれかに interactive OAuth を含む
+// 検証観点: 文字列マッチ単独で exit を動かさない（ADR 0001）
+func TestCase7_RunNonEmptyBodyWithLogMatchesWarnings(t *testing.T) {
+	home := newHome(t)
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_LOG_EXTRA", fixture)
+	t.Setenv("STUB_BODY", "answer")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil {
+		t.Fatalf("expected error == nil, got %+v", r.Error)
+	}
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "interactive OAuth") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning containing 'interactive OAuth', got warnings: %v", r.Warnings)
+	}
+}
+
+// Case 8: auth_required はモデル fallback を起こさない
+// 前提: Case 6 と同じ + -m gemini-3.5-flash-high,gemini-3.1-pro-high、STUB_COUNT_FILE を設定
+// 手順: run(t, home, ["-m", "...", "x"])
+// 期待挙動: rc 45、STUB_COUNT_FILE の値が 1、error.models_tried が空
+// 検証観点: exit 42 の再試行契約を汚さないこと（ADR 0001「壊すと危ない前提」）
+func TestCase8_RunAuthRequiredNoModelFallback(t *testing.T) {
+	home := newHome(t)
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_LOG_EXTRA", fixture)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "1")
+	cntFile := filepath.Join(home, "stub_count")
+	t.Setenv("STUB_COUNT_FILE", cntFile)
+
+	rc, out, _ := run(t, home, []string{"-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "x"})
+	if rc != config.ExitAuthRequired {
+		t.Fatalf("rc = %d, want %d (ExitAuthRequired)", rc, config.ExitAuthRequired)
+	}
+	cntData, err := os.ReadFile(cntFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	if strings.TrimSpace(string(cntData)) != "1" {
+		t.Errorf("STUB_COUNT_FILE = %q, want 1", string(cntData))
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "auth_required" {
+		t.Fatalf("expected auth_required error, got %+v", r.Error)
+	}
+	if len(r.Error.ModelsTried) != 0 {
+		t.Errorf("models_tried = %v, want empty", r.Error.ModelsTried)
+	}
+}
+
+// Case 9: 一致行と 429 が同時にあり本文 0 バイトなら auth_required が勝つ
+// 前提: STUB_LOG_EXTRA = fixture 行 + 改行 + HTTP 429 resource_exhausted. Resets in 0h0m1s、STUB_BODY 空、STUB_EXIT=0
+// 手順: run(t, home, ["x"])
+// 期待挙動: rc 45、error.reason == "auth_required"
+// 検証観点: 分類の優先順位（auth_required → rate_limited）が実装に固定されていること
+func TestCase9_AuthRequiredPrecedesRateLimited(t *testing.T) {
+	home := newHome(t)
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_LOG_EXTRA", fixture+"\nHTTP 429 resource_exhausted. Resets in 0h0m1s")
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "0")
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitAuthRequired {
+		t.Fatalf("rc = %d, want %d (ExitAuthRequired)", rc, config.ExitAuthRequired)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "auth_required" {
+		t.Fatalf("expected auth_required error, got %+v", r.Error)
+	}
+}
+
+// 追加テスト: TestAuthProbe_NonEmptyBodyAfterMatchReturnsNone / TOCTOU 防止: 一致行走査後に本文サイズを確認し非空なら None を返す判定順序の検証
+func TestAuthProbe_NonEmptyBodyAfterMatchReturnsNone(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "agy.log")
+	const fixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth\n"
+	if err := os.WriteFile(logPath, []byte(fixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	bodyNonEmpty := filepath.Join(dir, "body_nonempty")
+	if err := os.WriteFile(bodyNonEmpty, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	bodyEmpty := filepath.Join(dir, "body_empty")
+	if err := os.WriteFile(bodyEmpty, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	bodyMissing := filepath.Join(dir, "body_missing")
+	logMissing := filepath.Join(dir, "log_missing")
+
+	// 1. 1 バイト以上の本文ファイル -> None
+	if got := authProbe(logPath, bodyNonEmpty); got != watchdog.None {
+		t.Errorf("authProbe(log, bodyNonEmpty) = %v, want None", got)
+	}
+
+	// 2. 本文ファイルが 0 バイト -> AuthRequired
+	if got := authProbe(logPath, bodyEmpty); got != watchdog.AuthRequired {
+		t.Errorf("authProbe(log, bodyEmpty) = %v, want AuthRequired", got)
+	}
+
+	// 3. 本文ファイル不在 -> AuthRequired
+	if got := authProbe(logPath, bodyMissing); got != watchdog.AuthRequired {
+		t.Errorf("authProbe(log, bodyMissing) = %v, want AuthRequired", got)
+	}
+
+	// 4. ログ不在 -> None
+	if got := authProbe(logMissing, bodyEmpty); got != watchdog.None {
+		t.Errorf("authProbe(logMissing, bodyEmpty) = %v, want None", got)
+	}
+}
+
+
 
 
 
