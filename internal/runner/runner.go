@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rengotaku/agy-run/internal/authreq"
 	"github.com/rengotaku/agy-run/internal/config"
 	"github.com/rengotaku/agy-run/internal/convlog"
 	"github.com/rengotaku/agy-run/internal/emit"
@@ -28,6 +29,8 @@ import (
 	"github.com/rengotaku/agy-run/internal/watchdog"
 	"github.com/rengotaku/agy-run/internal/workspace"
 )
+
+const authRequiredHint = "agy が非対話実行中に OAuth ログインを要求した。keyring (D-Bus) に届いていない可能性が高い。Claude Code の Bash sandbox 内なら sandbox.excludedCommands に agy-run を追加する。手元でログインし直すなら引数なしで agy を起動する。"
 
 // timeNow and sleepFor are overridable in tests; production uses the wall clock.
 var (
@@ -324,6 +327,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		Abs:   time.Duration(cfg.AbsLimitSec) * time.Second,
 		Poll:  time.Duration(cfg.PollSec) * time.Second,
 		Paths: heartbeatPaths(logFile, bodyPath, paths.BrainDir, logFile),
+		Probe: func() watchdog.Reason { return authProbe(logFile, bodyPath) },
 	}
 	reasonCh := make(chan watchdog.Reason, 1)
 	go func() { reasonCh <- w.Run(runCtx, func() { _ = killGroup(cmd.Process) }) }()
@@ -393,11 +397,15 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		}
 	}
 
-	// Stall / absolute-timeout branches: log tail to stderr, error in the result.
-	if reason == watchdog.Stall || reason == watchdog.AbsTimeout {
+	// Stall / absolute-timeout / auth-required branches: log tail to stderr, error in the result.
+	if reason == watchdog.Stall || reason == watchdog.AbsTimeout || reason == watchdog.AuthRequired {
 		touch(paths.KillStamp)
 		printLogTail(e, logFile)
-		r.Error = killError(reason, cfg)
+		detail := ""
+		if reason == watchdog.AuthRequired {
+			detail, _ = authreq.Detect(logFile)
+		}
+		r.Error = killError(reason, cfg, detail)
 		r.ExitCode = rc
 		rec.ExitCode = rc
 		rec.ErrorClass = r.Error.Reason
@@ -421,14 +429,34 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 			len(fails)))
 	}
 
+	// Auth-required classification (post-exit): if agy exited on its own, but log has
+	// the interactive OAuth transition line.
+	// Precedence: after watchdog kill, before rate_limited.
+	if authLine, ok := authreq.Detect(logFile); ok {
+		if len(body) == 0 {
+			r.Error = &emit.Error{
+				Reason: "auth_required",
+				Detail: authLine,
+				Hint:   authRequiredHint,
+			}
+			rc = config.ExitAuthRequired
+		} else {
+			r.Warnings = append(r.Warnings, fmt.Sprintf(
+				"本文は返っていますがログに interactive OAuth の兆候があります (%s)。exit_code は変更されていません。",
+				authLine))
+		}
+	}
+
 	// Rate-limit / artifact-missing / empty-output / generic-failure classification.
 	if hits := ratelimit.CountHits(logFile); hits > 0 {
 		if len(body) == 0 {
-			r.Error = &emit.Error{
-				Reason: "rate_limited", LogRatelimitHits: hits,
-				Hint: "agyの5時間枠/レート上限の可能性。-m にフォールバック候補を並べるか --wait-quota でリセット待機を検討。",
+			if r.Error == nil {
+				r.Error = &emit.Error{
+					Reason: "rate_limited", LogRatelimitHits: hits,
+					Hint: "agyの5時間枠/レート上限の可能性。-m にフォールバック候補を並べるか --wait-quota でリセット待機を検討。",
+				}
+				rc = config.ExitRateLimited // contract: 42 = empty body + rate-limit signature, whatever agy's own exit code was.
 			}
-			rc = config.ExitRateLimited // contract: 42 = empty body + rate-limit signature, whatever agy's own exit code was.
 		} else {
 			r.Warnings = append(r.Warnings, fmt.Sprintf(
 				"本文は返っていますがログにレート制限の兆候があります (レート制限シグネチャのヒット数: %d)。exit_code は変更されていません。",
@@ -436,8 +464,8 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		}
 	}
 
-	// Artifact-missing classification (only if not rate_limited).
-	if r.Error == nil || r.Error.Reason != "rate_limited" {
+	// Artifact-missing classification (only if not rate_limited and not auth_required).
+	if r.Error == nil {
 		if tp := convlog.TranscriptPath(paths.BrainDir, convID); tp != "" {
 			toolCalls := convlog.CountArtifactToolCalls(tp, start)
 			if err := convlog.CheckArtifactMissing(toolCalls, r.Artifacts); err != nil {
@@ -533,22 +561,54 @@ func heartbeatPaths(logFile, bodyPath, brainDir, logForConv string) func() []str
 	}
 }
 
-// killError builds the structured error for a stall (exit 44) or absolute
-// timeout (exit 124), pointing the reader at the stderr log tail.
-func killError(reason watchdog.Reason, cfg config.Config) *emit.Error {
-	if reason == watchdog.Stall {
+// authProbe checks whether agy triggered an interactive OAuth flow while
+// running in non-interactive mode. To prevent TOCTOU races, it scans the log
+// for the signature line FIRST, and only if a match is found does it check the
+// body capture size — returning AuthRequired if the body is 0 bytes (or not yet
+// created), and None otherwise.
+func authProbe(logFile, bodyPath string) watchdog.Reason {
+	if _, ok := authreq.Detect(logFile); !ok {
+		return watchdog.None
+	}
+	fi, err := os.Stat(bodyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return watchdog.AuthRequired
+		}
+		return watchdog.None
+	}
+	if fi.Size() == 0 {
+		return watchdog.AuthRequired
+	}
+	return watchdog.None
+}
+
+// killError builds the structured error for a stall (exit 44), absolute
+// timeout (exit 124), or auth_required (exit 45), pointing the reader at the
+// stderr log tail.
+func killError(reason watchdog.Reason, cfg config.Config, detail string) *emit.Error {
+	switch reason {
+	case watchdog.Stall:
 		return &emit.Error{
 			Reason:       "stall",
 			IdleLimitSec: cfg.IdleLimitSec,
 			Note:         "heartbeat 途絶（agy 応答停止）。stderr にログ末尾を出力。",
 		}
+	case watchdog.AbsTimeout:
+		return &emit.Error{
+			Reason:       "timeout",
+			AbsLimitSec:  cfg.AbsLimitSec,
+			PrintTimeout: cfg.PrintTimeout,
+			Note:         "絶対上限に到達。stderr にログ末尾を出力。",
+		}
+	case watchdog.AuthRequired:
+		return &emit.Error{
+			Reason: "auth_required",
+			Detail: detail,
+			Hint:   authRequiredHint,
+		}
 	}
-	return &emit.Error{
-		Reason:       "timeout",
-		AbsLimitSec:  cfg.AbsLimitSec,
-		PrintTimeout: cfg.PrintTimeout,
-		Note:         "絶対上限に到達。stderr にログ末尾を出力。",
-	}
+	return &emit.Error{Reason: "unknown"}
 }
 
 // printLogTail writes the last few log lines (free text) to stderr for the
@@ -661,6 +721,8 @@ func exitCode(cmd *exec.Cmd, waitErr error, reason watchdog.Reason) int {
 		return config.ExitStall
 	case watchdog.AbsTimeout:
 		return config.ExitAbsTimeout
+	case watchdog.AuthRequired:
+		return config.ExitAuthRequired
 	}
 	if cmd.ProcessState != nil {
 		if code := cmd.ProcessState.ExitCode(); code >= 0 {

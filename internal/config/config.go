@@ -17,6 +17,7 @@ const (
 	ExitRateLimited      = 42  // empty body + rate-limit signature in log
 	ExitArtifactMissing  = 43  // artifact-generating tools called but zero artifacts written
 	ExitStall            = 44  // idle watchdog: heartbeat stalled past idle limit
+	ExitAuthRequired     = 45  // non-interactive run hit interactive OAuth prompt
 	ExitAbsTimeout  = 124 // absolute wall-clock limit exceeded
 )
 

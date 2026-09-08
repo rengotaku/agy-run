@@ -8,7 +8,7 @@
 // the right tools for the job.
 //
 // Exit codes: 0 success / 2 usage / 4 slot lock timeout / 42 rate_limited /
-// 43 artifact_missing / 44 idle stall / 124 absolute timeout / else agy's own code.
+// 43 artifact_missing / 44 idle stall / 45 auth_required / 124 absolute timeout / else agy's own code.
 package main
 
 import (
@@ -84,6 +84,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
       warnings に出す（agy の自己申告「テスト緑」の誤信を出力側から防ぐ）
     - レート制限検出: 本文ゼロ時は exit 42 (rate_limited) とするが、本文非空時は exit code / error
       を変えず warnings にヒット件数を記録する（調査タスク等での誤検知による中断を防ぐ）
+    - 認証要求の即時検知: 非対話 print mode 中に agy が interactive OAuth に入った場合、
+      ハングを待たずに即時 kill → exit 45 (auth_required)
     - 単一 JSON 出力: 実行結果を stdout に 1 個の JSON にまとめる（encoding/json で常にエスケープ）
 
 環境変数:
@@ -127,7 +129,8 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
 exit code:
     0=成功 / 2=引数エラー / 4=スロットロック待ちタイムアウト /
     42=レート制限（本文ゼロ＋ログに 429）/ 43=成果物生成失敗（成果物ツール呼出あり＋artifactsゼロ）/
-    44=アイドルストール（heartbeat 途絶）/ 124=絶対上限タイムアウト / その他=agy 自身の exit code
+    44=アイドルストール（heartbeat 途絶）/ 45=認証要求（非対話実行中に interactive OAuth 要求）/
+    124=絶対上限タイムアウト / その他=agy 自身の exit code
 `
 
 func main() {
