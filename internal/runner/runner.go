@@ -13,8 +13,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,8 +37,9 @@ const authRequiredHint = "agy が非対話実行中に OAuth ログインを要�
 
 // timeNow and sleepFor are overridable in tests; production uses the wall clock.
 var (
-	timeNow  = time.Now
-	sleepFor = time.Sleep
+	timeNow   = time.Now
+	sleepFor  = time.Sleep
+	afterWait func(context.Context)
 )
 
 // Options are the runtime dependencies (injected for testability).
@@ -127,6 +130,16 @@ func Run(cfg config.Config, opt Options) int {
 		defer stopSignal()
 	}
 
+	// テストの決定性のため、Run はシグナル監視を開始する時点で Options.Signals に既に入っているシグナルを同期的に取り込む
+	select {
+	case sig, ok := <-sigCh:
+		if ok && sig != nil {
+			tracker.set(sig)
+			cancel()
+		}
+	default:
+	}
+
 	sigDone := make(chan struct{})
 	defer close(sigDone)
 	go func() {
@@ -198,6 +211,23 @@ func signalName(sig os.Signal) string {
 	}
 }
 
+// waitQuotaSleep pauses for duration d or until ctx is cancelled.
+// In tests, sleepFor may be overridden to record or fake the wait.
+func waitQuotaSleep(ctx context.Context, d time.Duration) error {
+	if reflect.ValueOf(sleepFor).Pointer() != reflect.ValueOf(time.Sleep).Pointer() {
+		sleepFor(d)
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // cooldown sleeps out the remainder of the post-kill cooldown window if a kill
 // stamp exists and is recent, printing a human advisory to stderr.
 func cooldown(e *emit.Emitter, killStamp string) {
@@ -226,6 +256,26 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
 
 		if rc == config.ExitRateLimited && (r.Error == nil || r.Error.Reason != "cancelled_by_signal") {
+			// モデル fallback と `--wait-quota` の分岐に入る前にも `signalFromContext(ctx)` を確認し、受信済みなら同じ結果を返す
+			if sig := signalFromContext(ctx); sig != nil {
+				sigNum := 0
+				if sysSig, ok := sig.(syscall.Signal); ok {
+					sigNum = int(sysSig)
+				}
+				sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+				r.Error = &emit.Error{
+					Reason: "cancelled_by_signal",
+					Detail: signalName(sig),
+				}
+				r.ExitCode = sigExit
+				r.Warnings = prependWarning(r.Warnings, preflight)
+				for _, w := range r.Warnings {
+					e.Note("warning: " + w)
+				}
+				e.Emit(r)
+				return sigExit
+			}
+
 			// Model fallback: try the next candidate from -m "A,B,...".
 			if i < len(models)-1 {
 				e.Note(fmt.Sprintf("rate_limited: %s が上限。次候補 %s で再試行します。",
@@ -239,7 +289,27 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 					limit := time.Duration(cfg.MaxQuotaWait) * time.Second
 					if d <= limit {
 						e.Note(fmt.Sprintf("--wait-quota: リセットまで %s 待機して再試行します。", d))
-						sleepFor(d)
+						if err := waitQuotaSleep(ctx, d); err != nil {
+							if sig := signalFromContext(ctx); sig != nil {
+								sigNum := 0
+								if sysSig, ok := sig.(syscall.Signal); ok {
+									sigNum = int(sysSig)
+								}
+								sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+								r.Error = &emit.Error{
+									Reason: "cancelled_by_signal",
+									Detail: signalName(sig),
+								}
+								r.ExitCode = sigExit
+								r.Warnings = prependWarning(r.Warnings, preflight)
+								for _, w := range r.Warnings {
+									e.Note("warning: " + w)
+								}
+								e.Emit(r)
+								return sigExit
+							}
+							return rc
+						}
 						waited = true
 						if r.Error != nil {
 							r.Error.WaitedSec = int(d.Seconds())
@@ -394,10 +464,50 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	// grandchild keeps an inherited output pipe open — this only arises when
 	// Stderr is not a raw *os.File (e.g. the test harness); it is harmless in the
 	// production path where Stderr is os.Stderr.
-	cmd.Cancel = func() error { return killGroup(cmd.Process) }
+	var cancelCalled atomic.Bool
+	cmd.Cancel = func() error {
+		cancelCalled.Store(true)
+		return killGroup(cmd.Process)
+	}
 	cmd.WaitDelay = 2 * time.Second
 	if cfg.Workspace != "" {
 		cmd.Dir = cfg.Workspace // pin agy's cwd so RUN_COMMAND resolves correctly (issue #1)
+	}
+
+	if err := ctx.Err(); err != nil {
+		if sig := signalFromContext(ctx); sig != nil {
+			_ = bodyCap.Close()
+			sigNum := 0
+			if sysSig, ok := sig.(syscall.Signal); ok {
+				sigNum = int(sysSig)
+			}
+			sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+			r := emit.Result{
+				ExitCode: sigExit,
+				Error: &emit.Error{
+					Reason: "cancelled_by_signal",
+					Detail: signalName(sig),
+				},
+			}
+			rec := index.Record{
+				TSStart:         tsStart,
+				TSEnd:           timeNow().Format(time.RFC3339),
+				DurationMS:      timeNow().Sub(start).Milliseconds(),
+				ClaudeSessionID: opt.Getenv("CLAUDE_CODE_SESSION_ID"),
+				ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
+				Continued:       cfg.Continued(),
+				Model:           model,
+				CWD:             effectiveWorkDir(cfg),
+				Prompt:          cfg.Prompt,
+				Artifacts:       []string{},
+				Sandbox:         cfg.Sandbox,
+				NetLog:          netLogPath,
+				ExitCode:        sigExit,
+				ErrorClass:      r.Error.Reason,
+			}
+			index.Append(paths.IndexFile, rec)
+			return r, sigExit, logFile
+		}
 	}
 
 	if serr := cmd.Start(); serr != nil {
@@ -418,6 +528,9 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	go func() { reasonCh <- w.Run(runCtx, func() { _ = killGroup(cmd.Process) }) }()
 
 	waitErr := cmd.Wait()
+	if afterWait != nil {
+		afterWait(ctx)
+	}
 	cancel()
 	reason := <-reasonCh
 	_ = bodyCap.Close()
@@ -499,7 +612,7 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	}
 
 	// Cancelled by signal: agy-run received SIGINT/SIGTERM/SIGHUP and killed the agy process group.
-	if sig := signalFromContext(ctx); sig != nil {
+	if sig := signalFromContext(ctx); sig != nil && cancelCalled.Load() {
 		sigNum := 0
 		if sysSig, ok := sig.(syscall.Signal); ok {
 			sigNum = int(sysSig)

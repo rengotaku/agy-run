@@ -1593,6 +1593,246 @@ func TestSignalName(t *testing.T) {
 	}
 }
 
+// Case 7: cmd.Wait 完了後のシグナルは結果を上書きしない
+func TestCase7_SignalAfterWaitDoesNotOverwriteSuccess(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "ok")
+	t.Setenv("STUB_EXIT", "0")
+
+	sigCh := make(chan os.Signal, 1)
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	afterWait = func(ctx context.Context) {
+		sigCh <- syscall.SIGTERM
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if signalFromContext(ctx) != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Error("signal was not recorded in context within 2s")
+	}
+	t.Cleanup(func() { afterWait = nil })
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	rc := Run(cfg, opt)
+	if rc != 0 {
+		t.Errorf("rc = %d, want 0", rc)
+	}
+
+	r := parseResult(t, out.String())
+	if r.ExitCode != 0 {
+		t.Errorf("result exit_code = %d, want 0", r.ExitCode)
+	}
+	if !strings.Contains(r.Body, "ok") {
+		t.Errorf("result body = %q, want containing \"ok\"", r.Body)
+	}
+	if r.Error != nil {
+		t.Errorf("result error = %+v, want nil", r.Error)
+	}
+
+	rec := readLastIndexRecord(t, home)
+	if rec.ExitCode != 0 {
+		t.Errorf("index exit_code = %d, want 0", rec.ExitCode)
+	}
+	if rec.ErrorClass != "" {
+		t.Errorf("index error_class = %q, want empty", rec.ErrorClass)
+	}
+}
+
+// Case 8: cmd.Start 前にシグナル受信済みなら agy を起動しない
+func TestCase8_SignalBeforeStartDoesNotSpawn(t *testing.T) {
+	home := newHome(t)
+	countFile := filepath.Join(t.TempDir(), "stub.count")
+	t.Setenv("STUB_COUNT_FILE", countFile)
+
+	sigCh := make(chan os.Signal, 1)
+	sigCh <- syscall.SIGTERM
+
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	rc := Run(cfg, opt)
+	if rc != 143 {
+		t.Errorf("rc = %d, want 143", rc)
+	}
+
+	r := parseResult(t, out.String())
+	if r.ExitCode != 143 {
+		t.Errorf("result exit_code = %d, want 143", r.ExitCode)
+	}
+	if r.Error == nil {
+		t.Fatalf("result error is nil, want cancelled_by_signal")
+	}
+	if r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %q, want %q", r.Error.Reason, "cancelled_by_signal")
+	}
+	if r.Error.Detail != "SIGTERM" {
+		t.Errorf("error.detail = %q, want %q", r.Error.Detail, "SIGTERM")
+	}
+
+	if _, err := os.Stat(countFile); !os.IsNotExist(err) {
+		t.Errorf("count file exists (stub was spawned), want not exist")
+	}
+}
+
+// Case 9: --wait-quota 待機中のシグナルで即時終了する
+func TestCase9_SignalDuringWaitQuotaExitsPromptly(t *testing.T) {
+	home := newHome(t)
+	countFile := filepath.Join(t.TempDir(), "stub.count")
+	t.Setenv("STUB_RL_UNTIL", "1")
+	t.Setenv("STUB_RESET", "0h0m20s")
+	t.Setenv("STUB_COUNT_FILE", countFile)
+
+	sigCh := make(chan os.Signal, 1)
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "-m", "gemini-3.5-flash-high", "--wait-quota", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	afterWait = func(ctx context.Context) {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+			sigCh <- syscall.SIGTERM
+		}()
+	}
+	t.Cleanup(func() { afterWait = nil })
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	start := time.Now()
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(cfg, opt)
+	}()
+
+	var rc int
+	select {
+	case rc = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return within 5s during --wait-quota")
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 5*time.Second {
+		t.Errorf("Run took %v, want < 5s", elapsed)
+	}
+
+	if rc != 143 {
+		t.Errorf("rc = %d, want 143", rc)
+	}
+
+	r := parseResult(t, out.String())
+	if r.ExitCode != 143 {
+		t.Errorf("result exit_code = %d, want 143", r.ExitCode)
+	}
+	if r.Error == nil || r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %v, want cancelled_by_signal", r.Error)
+	}
+	if r.Error != nil && r.Error.Detail != "SIGTERM" {
+		t.Errorf("error.detail = %q, want SIGTERM", r.Error.Detail)
+	}
+
+	cntBytes, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	cnt := strings.TrimSpace(string(cntBytes))
+	if cnt != "1" {
+		t.Errorf("stub invocation count = %q, want \"1\"", cnt)
+	}
+}
+
+// Case 10: fallback 判定前にシグナルを確認する
+func TestCase10_SignalBeforeFallbackPreventsNextCandidate(t *testing.T) {
+	home := newHome(t)
+	countFile := filepath.Join(t.TempDir(), "stub.count")
+	t.Setenv("STUB_RL_MODEL", "gemini-3.5-flash-high")
+	t.Setenv("STUB_COUNT_FILE", countFile)
+
+	sigCh := make(chan os.Signal, 1)
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	afterWait = func(ctx context.Context) {
+		sigCh <- syscall.SIGTERM
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if signalFromContext(ctx) != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Error("signal was not recorded in context within 2s")
+	}
+	t.Cleanup(func() { afterWait = nil })
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	rc := Run(cfg, opt)
+	if rc != 143 {
+		t.Errorf("rc = %d, want 143", rc)
+	}
+
+	r := parseResult(t, out.String())
+	if r.ExitCode != 143 {
+		t.Errorf("result exit_code = %d, want 143", r.ExitCode)
+	}
+	if r.Error == nil || r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %v, want cancelled_by_signal", r.Error)
+	}
+	if r.Error != nil && len(r.Error.ModelsTried) > 0 {
+		t.Errorf("error.models_tried = %v, want empty", r.Error.ModelsTried)
+	}
+
+	cntBytes, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	cnt := strings.TrimSpace(string(cntBytes))
+	if cnt != "1" {
+		t.Errorf("stub invocation count = %q, want \"1\"", cnt)
+	}
+}
+
 
 
 
