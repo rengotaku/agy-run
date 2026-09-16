@@ -8,12 +8,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/rengotaku/agy-run/internal/config"
 	"github.com/rengotaku/agy-run/internal/emit"
+	"github.com/rengotaku/agy-run/internal/index"
 	"github.com/rengotaku/agy-run/internal/watchdog"
 )
 
@@ -73,6 +76,7 @@ if [ -n "$logfile" ]; then
 fi
 if [ "$rl" = "1" ]; then exit 0; fi
 if [ -n "$STUB_BODY" ]; then printf '%s\n' "$STUB_BODY"; fi
+if [ -n "$STUB_PID_FILE" ]; then echo $$ > "$STUB_PID_FILE"; fi
 if [ -n "$STUB_SLEEP" ]; then sleep "$STUB_SLEEP"; fi
 exit ${STUB_EXIT:-0}
 `
@@ -1306,6 +1310,286 @@ func TestAuthProbe_NonEmptyBodyAfterMatchReturnsNone(t *testing.T) {
 	// 4. ログ不在 -> None
 	if got := authProbe(logMissing, bodyEmpty); got != watchdog.None {
 		t.Errorf("authProbe(logMissing, bodyEmpty) = %v, want None", got)
+	}
+}
+
+func waitPIDFilePoll(t *testing.T, path string, interval, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(interval)
+	}
+	t.Fatalf("pid file %s was never populated within %s", path, timeout)
+	return 0
+}
+
+func readLastIndexRecord(t *testing.T, home string) index.Record {
+	t.Helper()
+	idxPath := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatalf("read index file %s: %v", idxPath, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 || lines[0] == "" {
+		t.Fatalf("index file is empty: %s", idxPath)
+	}
+	var rec index.Record
+	last := lines[len(lines)-1]
+	if err := json.Unmarshal([]byte(last), &rec); err != nil {
+		t.Fatalf("unmarshal last index record %q: %v", last, err)
+	}
+	return rec
+}
+
+func testSignalCancel(t *testing.T, sig syscall.Signal, wantCode int, wantDetail string) {
+	t.Helper()
+	home := newHome(t)
+	pidFile := filepath.Join(t.TempDir(), "stub.pid")
+	t.Setenv("STUB_SLEEP", "30")
+	t.Setenv("STUB_PID_FILE", pidFile)
+
+	sigCh := make(chan os.Signal, 1)
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	start := time.Now()
+	type runResult struct {
+		rc int
+	}
+	done := make(chan runResult, 1)
+	go func() {
+		rc := Run(cfg, opt)
+		done <- runResult{rc: rc}
+	}()
+
+	pid := waitPIDFilePoll(t, pidFile, 50*time.Millisecond, 5*time.Second)
+
+	sigCh <- sig
+
+	var res runResult
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return within 10s after signal")
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 10*time.Second {
+		t.Errorf("Run took %v, want < 10s", elapsed)
+	}
+
+	if res.rc != wantCode {
+		t.Errorf("rc = %d, want %d", res.rc, wantCode)
+	}
+
+	r := parseResult(t, out.String())
+	if r.ExitCode != wantCode {
+		t.Errorf("result exit_code = %d, want %d", r.ExitCode, wantCode)
+	}
+	if r.Error == nil {
+		t.Fatalf("result error is nil, want reason=%q", "cancelled_by_signal")
+	}
+	if r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %q, want %q", r.Error.Reason, "cancelled_by_signal")
+	}
+	if r.Error.Detail != wantDetail {
+		t.Errorf("error.detail = %q, want %q", r.Error.Detail, wantDetail)
+	}
+
+	rec := readLastIndexRecord(t, home)
+	if rec.ErrorClass != "cancelled_by_signal" {
+		t.Errorf("index error_class = %q, want %q", rec.ErrorClass, "cancelled_by_signal")
+	}
+	if rec.ExitCode != wantCode {
+		t.Errorf("index exit_code = %d, want %d", rec.ExitCode, wantCode)
+	}
+
+	deadWithin(t, pid, 3*time.Second)
+}
+
+// Case 1: SIGTERM 受信で cancelled_by_signal / 143
+func TestCase1_SIGTERM(t *testing.T) {
+	testSignalCancel(t, syscall.SIGTERM, 143, "SIGTERM")
+}
+
+// Case 2: SIGINT → 130 / SIGINT、SIGHUP → 129 / SIGHUP
+func TestCase2_SIGINT_SIGHUP(t *testing.T) {
+	cases := []struct {
+		name       string
+		sig        syscall.Signal
+		wantCode   int
+		wantDetail string
+	}{
+		{name: "SIGINT", sig: syscall.SIGINT, wantCode: 130, wantDetail: "SIGINT"},
+		{name: "SIGHUP", sig: syscall.SIGHUP, wantCode: 129, wantDetail: "SIGHUP"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testSignalCancel(t, tc.sig, tc.wantCode, tc.wantDetail)
+		})
+	}
+}
+
+// Case 3: シグナル受信は rate_limited より優先し、モデル fallback を起こさない
+func TestCase3_SignalPriorityOverRateLimit(t *testing.T) {
+	home := newHome(t)
+	pidFile := filepath.Join(t.TempDir(), "stub.pid")
+	countFile := filepath.Join(t.TempDir(), "stub.count")
+	t.Setenv("STUB_SLEEP", "30")
+	t.Setenv("STUB_PID_FILE", pidFile)
+	t.Setenv("STUB_LOG_EXTRA", "HTTP 429 resource_exhausted. Resets in 0h0m1s")
+	t.Setenv("STUB_COUNT_FILE", countFile)
+
+	sigCh := make(chan os.Signal, 1)
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: sigCh,
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(cfg, opt)
+	}()
+
+	pid := waitPIDFilePoll(t, pidFile, 50*time.Millisecond, 5*time.Second)
+	sigCh <- syscall.SIGTERM
+
+	var rc int
+	select {
+	case rc = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return within 10s after SIGTERM")
+	}
+
+	if rc != 143 {
+		t.Errorf("rc = %d, want 143", rc)
+	}
+	r := parseResult(t, out.String())
+	if r.ExitCode != 143 {
+		t.Errorf("result exit_code = %d, want 143", r.ExitCode)
+	}
+	if r.Error == nil || r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %v, want cancelled_by_signal", r.Error)
+	}
+	if r.Error != nil && len(r.Error.ModelsTried) > 0 {
+		t.Errorf("error.models_tried = %v, want empty", r.Error.ModelsTried)
+	}
+
+	cntBytes, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	cnt := strings.TrimSpace(string(cntBytes))
+	if cnt != "1" {
+		t.Errorf("stub invocation count = %q, want \"1\"", cnt)
+	}
+
+	deadWithin(t, pid, 3*time.Second)
+}
+
+// Case 4: 外から agy だけが SIGKILL された場合は 137 / agy_error / detail signal: killed
+func TestCase4_ExternalSIGKILL(t *testing.T) {
+	home := newHome(t)
+	pidFile := filepath.Join(t.TempDir(), "stub.pid")
+	t.Setenv("STUB_SLEEP", "30")
+	t.Setenv("STUB_PID_FILE", pidFile)
+
+	cfg, _, err := config.Parse([]string{"--no-sandbox", "do task"}, os.Getenv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	var out, errb bytes.Buffer
+	opt := Options{
+		Stdout:  &out,
+		Stderr:  &errb,
+		Home:    home,
+		Getenv:  os.Getenv,
+		Signals: nil,
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- Run(cfg, opt)
+	}()
+
+	pid := waitPIDFilePoll(t, pidFile, 50*time.Millisecond, 5*time.Second)
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill stub: %v", err)
+	}
+
+	var rc int
+	select {
+	case rc = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return within 10s after SIGKILL")
+	}
+
+	if rc != 137 {
+		t.Errorf("rc = %d, want 137", rc)
+	}
+	r := parseResult(t, out.String())
+	if r.ExitCode != 137 {
+		t.Errorf("result exit_code = %d, want 137", r.ExitCode)
+	}
+	if r.Error == nil {
+		t.Fatalf("result error is nil, want reason=%q", "agy_error")
+	}
+	if r.Error.Reason != "agy_error" {
+		t.Errorf("error.reason = %q, want %q", r.Error.Reason, "agy_error")
+	}
+	if r.Error.Detail != "signal: killed" {
+		t.Errorf("error.detail = %q, want %q", r.Error.Detail, "signal: killed")
+	}
+
+	rec := readLastIndexRecord(t, home)
+	if rec.ErrorClass != "agy_error" {
+		t.Errorf("index error_class = %q, want %q", rec.ErrorClass, "agy_error")
+	}
+	if rec.ExitCode != 137 {
+		t.Errorf("index exit_code = %d, want 137", rec.ExitCode)
+	}
+}
+
+func TestSignalName(t *testing.T) {
+	tests := []struct {
+		sig  os.Signal
+		want string
+	}{
+		{sig: syscall.SIGINT, want: "SIGINT"},
+		{sig: syscall.SIGTERM, want: "SIGTERM"},
+		{sig: syscall.SIGHUP, want: "SIGHUP"},
+		{sig: syscall.SIGUSR1, want: "signal 10"},
+	}
+	for _, tc := range tests {
+		if got := signalName(tc.sig); got != tc.want {
+			t.Errorf("signalName(%v) = %q, want %q", tc.sig, got, tc.want)
+		}
 	}
 }
 

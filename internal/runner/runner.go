@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -40,10 +41,11 @@ var (
 
 // Options are the runtime dependencies (injected for testability).
 type Options struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Home   string
-	Getenv func(string) string
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Home    string
+	Getenv  func(string) string
+	Signals <-chan os.Signal
 }
 
 // Run executes one invocation and returns the process exit code.
@@ -106,11 +108,94 @@ func Run(cfg config.Config, opt Options) int {
 	// the agy child (and its whole process group) is torn down instead of being
 	// orphaned when agy-run itself is terminated by its launcher — orphaned agy
 	// processes otherwise linger for days holding inotify watches (issue #7).
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
+	// We retain the caught signal so attempt() can distinguish our own signal
+	// cancellation from external kills (issue #53).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx, tracker := contextWithSignal(ctx)
+
+	sigCh := opt.Signals
+	var stopSignal func()
+	if sigCh == nil {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		sigCh = ch
+		stopSignal = func() { signal.Stop(ch) }
+	}
+	if stopSignal != nil {
+		defer stopSignal()
+	}
+
+	sigDone := make(chan struct{})
+	defer close(sigDone)
+	go func() {
+		select {
+		case sig, ok := <-sigCh:
+			if ok && sig != nil {
+				tracker.set(sig)
+				cancel()
+			}
+		case <-sigDone:
+		}
+	}()
 
 	return execute(ctx, cfg, opt, e, paths)
+}
+
+type sigKey struct{}
+
+type signalTracker struct {
+	mu  sync.Mutex
+	sig os.Signal
+}
+
+func (st *signalTracker) get() os.Signal {
+	if st == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.sig
+}
+
+func (st *signalTracker) set(sig os.Signal) {
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.sig == nil {
+		st.sig = sig
+	}
+}
+
+func contextWithSignal(ctx context.Context) (context.Context, *signalTracker) {
+	st := &signalTracker{}
+	return context.WithValue(ctx, sigKey{}, st), st
+}
+
+func signalFromContext(ctx context.Context) os.Signal {
+	if st, ok := ctx.Value(sigKey{}).(*signalTracker); ok {
+		return st.get()
+	}
+	return nil
+}
+
+func signalName(sig os.Signal) string {
+	switch sig {
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	default:
+		if sysSig, ok := sig.(syscall.Signal); ok {
+			return fmt.Sprintf("signal %d", int(sysSig))
+		}
+		return sig.String()
+	}
 }
 
 // cooldown sleeps out the remainder of the post-kill cooldown window if a kill
@@ -140,7 +225,7 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 		model := models[i]
 		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
 
-		if rc == config.ExitRateLimited {
+		if rc == config.ExitRateLimited && (r.Error == nil || r.Error.Reason != "cancelled_by_signal") {
 			// Model fallback: try the next candidate from -m "A,B,...".
 			if i < len(models)-1 {
 				e.Note(fmt.Sprintf("rate_limited: %s が上限。次候補 %s で再試行します。",
@@ -413,6 +498,24 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		return r, rc, logFile
 	}
 
+	// Cancelled by signal: agy-run received SIGINT/SIGTERM/SIGHUP and killed the agy process group.
+	if sig := signalFromContext(ctx); sig != nil {
+		sigNum := 0
+		if sysSig, ok := sig.(syscall.Signal); ok {
+			sigNum = int(sysSig)
+		}
+		sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+		r.Error = &emit.Error{
+			Reason: "cancelled_by_signal",
+			Detail: signalName(sig),
+		}
+		r.ExitCode = sigExit
+		rec.ExitCode = sigExit
+		rec.ErrorClass = r.Error.Reason
+		index.Append(paths.IndexFile, rec)
+		return r, sigExit, logFile
+	}
+
 	// body_file: copy the captured body to a stable per-conversation path.
 	if len(body) > 0 && convID != "" {
 		if dst, ok := copyBody(paths.LastBodyDir, convID, bodyPath); ok {
@@ -483,7 +586,11 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	}
 
 	if rc != config.ExitOK && r.Error == nil {
-		r.Error = &emit.Error{Reason: "agy_error"}
+		errObj := &emit.Error{Reason: "agy_error"}
+		if rc == 137 && waitErr != nil {
+			errObj.Detail = waitErr.Error()
+		}
+		r.Error = errObj
 	}
 
 	r.ExitCode = rc
@@ -732,7 +839,7 @@ func exitCode(cmd *exec.Cmd, waitErr error, reason watchdog.Reason) int {
 	if waitErr == nil {
 		return 0
 	}
-	return 137 // killed by a signal we did not initiate
+	return 137 // agy-run はシグナルを受けておらず、agy だけが外から殺された
 }
 
 // copyBody copies the captured body to <lastBodyDir>/<conv>.md and returns the

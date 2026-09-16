@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Exit codes (contract — callers depend on these).
@@ -20,6 +21,11 @@ const (
 	ExitAuthRequired     = 45  // non-interactive run hit interactive OAuth prompt
 	ExitAbsTimeout  = 124 // absolute wall-clock limit exceeded
 )
+
+// ExitForSignal returns the standard 128 + signal number exit code for a signal.
+func ExitForSignal(sig syscall.Signal) int {
+	return 128 + int(sig)
+}
 
 // Defaults for the durations and concurrency knobs.
 const (
