@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
@@ -233,4 +234,84 @@ func TestDetachSurvivesLauncherGroupTeardown(t *testing.T) {
 	if !pidAlive(grand) {
 		t.Fatalf("agy (grandchild pid %d) died with the launcher — delegation was cut short", grand)
 	}
+}
+
+// Case 6: 実バイナリ + 実 SIGTERM のエンドツーエンド
+func TestCase6_RealSIGTERME2E(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain unavailable")
+	}
+
+	bin := filepath.Join(t.TempDir(), "agy-run-bin")
+	build := exec.Command("go", "build", "-o", bin, ".")
+	build.Dir = "../.." // module root (the main package)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build agy-run: %v\n%s", err, out)
+	}
+
+	home := t.TempDir()
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gpidFile := filepath.Join(t.TempDir(), "gpid")
+	if err := os.WriteFile(filepath.Join(binDir, "agy"), []byte(grandchildStub(gpidFile)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	cmd := exec.Command(bin, "--no-sandbox", "hang please")
+	cmd.Stdout = &out
+	cmd.Env = append(os.Environ(),
+		"HOME="+home,
+		"XDG_DATA_HOME="+filepath.Join(home, "data"))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start agy-run: %v", err)
+	}
+
+	grand := waitPIDFile(t, gpidFile)
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal agy-run: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-time.After(10 * time.Second):
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		t.Fatal("agy-run did not exit after SIGTERM")
+	}
+
+	// プロセスの exit status が 143
+	if waitErr == nil {
+		t.Fatalf("expected exit error with status 143, got success")
+	}
+	exitErr, ok := waitErr.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected *exec.ExitError, got %T: %v", waitErr, waitErr)
+	}
+	if code := exitErr.ExitCode(); code != 143 {
+		t.Errorf("exit status = %d, want 143", code)
+	}
+
+	// stdout の JSON が error.reason: "cancelled_by_signal"、error.detail: "SIGTERM"、exit_code: 143
+	r := parseResult(t, out.String())
+	if r.ExitCode != 143 {
+		t.Errorf("result exit_code = %d, want 143", r.ExitCode)
+	}
+	if r.Error == nil {
+		t.Fatalf("result error is nil, want reason=%q", "cancelled_by_signal")
+	}
+	if r.Error.Reason != "cancelled_by_signal" {
+		t.Errorf("error.reason = %q, want %q", r.Error.Reason, "cancelled_by_signal")
+	}
+	if r.Error.Detail != "SIGTERM" {
+		t.Errorf("error.detail = %q, want %q", r.Error.Detail, "SIGTERM")
+	}
+
+	// 孫プロセスが 3 秒以内に死ぬ
+	deadWithin(t, grand, 3*time.Second)
 }

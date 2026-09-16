@@ -96,7 +96,9 @@
 | `ExitStall` | 44 | アイドル watchdog が判定。ハートビート (ログ・本文・`transcript.jsonl` の最新 mtime) の更新が `AGY_RUN_IDLE_LIMIT` 秒間途絶えた場合。 |
 | `ExitAuthRequired` | 45 | 非対話 print mode 中に agy が interactive OAuth を要求（一致行あり）かつ本文が 0 バイトの場合。実行中の watchdog kill、またはプロセス終了後の分類で発生。 |
 | `ExitAbsTimeout` | 124 | 絶対 watchdog が判定。実行開始からの経過時間が `AGY_RUN_ABS_LIMIT` 秒を超過した場合。 |
-| (agyのexit code) | その他 | agy プロセスが自発的に返した終了コード（137等のシグナル終了含む）。 |
+| - | 128+シグナル番号 | agy-run 自身が SIGINT(130) / SIGTERM(143) / SIGHUP(129) を受信し、agy プロセスグループを停止した場合 (`cancelled_by_signal`)。 |
+| - | 137 | agy-run はシグナルを受けておらず、agy だけが外から殺された（detail に waitErr）。 |
+| (agyのexit code) | その他 | agy プロセスが自発的に返した終了コード。 |
 
 ## 5. 失敗の分類の優先順位
 
@@ -104,16 +106,18 @@
 
 1. Watchdog 強制終了判定 (`Stall` / `AbsTimeout` / `AuthRequired`)
    `watchdog.Reason` が `Stall` の場合は `ExitStall` (44), `Reason: "stall"`。`AbsTimeout` の場合は `ExitAbsTimeout` (124), `Reason: "timeout"`。`AuthRequired` の場合は `ExitAuthRequired` (45), `Reason: "auth_required"` とし、ただちに処理を復帰する。
-2. 認証要求判定 (`auth_required`)
+2. シグナル受信判定 (`cancelled_by_signal`)
+   agy-run 自身が SIGINT / SIGTERM / SIGHUP を受けて agy プロセスグループを停止した場合に判定する。`rc = 128 + シグナル番号`（SIGINT=130, SIGTERM=143, SIGHUP=129）、`Reason: "cancelled_by_signal"`、`Detail: シグナル名`（`SIGINT` / `SIGTERM` / `SIGHUP`、その他は `signal <番号>`）とし、ただちに処理を復帰する。モデル fallback や `--wait-quota` 再試行は行わず、以降の auth_required / rate_limited / artifact_missing / empty_output の分類は行わない。
+3. 認証要求判定 (`auth_required`)
    ログ内に `printmode\.go:\d+\] Print mode: triggering interactive OAuth$` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitAuthRequired` (45), `Reason: "auth_required"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` に記録する。
-3. レート制限判定 (`rate_limited`)
+4. レート制限判定 (`rate_limited`)
    エラーが未設定の場合に判定する。ログ内に `429|overloaded|rate.?limit|resource_exhausted|quota` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitRateLimited` (42), `Reason: "rate_limited"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` にヒット件数を記録する。
-4. 成果物生成失敗判定 (`artifact_missing`)
+5. 成果物生成失敗判定 (`artifact_missing`)
    エラーが未設定の場合に判定する。`transcript.jsonl` を解析し、実行開始時刻以降の成果物生成ツール (`generate_image`) 呼び出し数が 1 以上で、かつ検出成果物数が 0 の場合に `rc = ExitArtifactMissing` (43), `Reason: "artifact_missing"` を設定する。
-5. 空出力判定 (`empty_output`)
+6. 空出力判定 (`empty_output`)
    本文が 0 バイト、`rc == ExitOK` (0)、かつエラーが未設定の場合に `Reason: "empty_output"` を設定する。終了コード (`rc`) は 0 のまま維持する。
-6. 汎用エラー判定 (`agy_error`)
-   `rc != ExitOK` (0) かつエラーが未設定の場合に `Reason: "agy_error"` を設定する。
+7. 汎用エラー判定 (`agy_error`)
+   `rc != ExitOK` (0) かつエラーが未設定の場合に `Reason: "agy_error"` を設定する（外から agy だけが殺された `rc == 137` の場合は `Detail` に `waitErr.Error()` が入る）。
 
 ## 6. transcript を読む機能 (internal/convlog)
 

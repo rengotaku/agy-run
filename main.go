@@ -130,7 +130,9 @@ exit code:
     0=成功 / 2=引数エラー / 4=スロットロック待ちタイムアウト /
     42=レート制限（本文ゼロ＋ログに 429）/ 43=成果物生成失敗（成果物ツール呼出あり＋artifactsゼロ）/
     44=アイドルストール（heartbeat 途絶）/ 45=認証要求（非対話実行中に interactive OAuth 要求）/
-    124=絶対上限タイムアウト / その他=agy 自身の exit code
+    124=絶対上限タイムアウト /
+    129/130/143=agy-run 自身が SIGHUP/SIGINT/SIGTERM を受信して中断（cancelled_by_signal）/
+    その他=agy 自身の exit code
 `
 
 func main() {

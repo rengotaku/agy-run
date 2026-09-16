@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"syscall"
 	"testing"
 )
 
@@ -294,5 +295,22 @@ func TestGetoptsDoubleDash(t *testing.T) {
 	}
 	if !reflect.DeepEqual(rest, []string{"-t", "notaflag"}) {
 		t.Errorf("rest = %v", rest)
+	}
+}
+
+func TestExitForSignal(t *testing.T) {
+	tests := []struct {
+		sig  syscall.Signal
+		want int
+	}{
+		{sig: syscall.SIGHUP, want: 129},
+		{sig: syscall.SIGINT, want: 130},
+		{sig: syscall.SIGKILL, want: 137},
+		{sig: syscall.SIGTERM, want: 143},
+	}
+	for _, tc := range tests {
+		if got := ExitForSignal(tc.sig); got != tc.want {
+			t.Errorf("ExitForSignal(%v) = %d, want %d", tc.sig, got, tc.want)
+		}
 	}
 }

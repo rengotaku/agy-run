@@ -13,7 +13,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -34,16 +37,18 @@ const authRequiredHint = "agy が非対話実行中に OAuth ログインを要�
 
 // timeNow and sleepFor are overridable in tests; production uses the wall clock.
 var (
-	timeNow  = time.Now
-	sleepFor = time.Sleep
+	timeNow   = time.Now
+	sleepFor  = time.Sleep
+	afterWait func(context.Context)
 )
 
 // Options are the runtime dependencies (injected for testability).
 type Options struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Home   string
-	Getenv func(string) string
+	Stdout  io.Writer
+	Stderr  io.Writer
+	Home    string
+	Getenv  func(string) string
+	Signals <-chan os.Signal
 }
 
 // Run executes one invocation and returns the process exit code.
@@ -106,11 +111,121 @@ func Run(cfg config.Config, opt Options) int {
 	// the agy child (and its whole process group) is torn down instead of being
 	// orphaned when agy-run itself is terminated by its launcher — orphaned agy
 	// processes otherwise linger for days holding inotify watches (issue #7).
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer stop()
+	// We retain the caught signal so attempt() can distinguish our own signal
+	// cancellation from external kills (issue #53).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctx, tracker := contextWithSignal(ctx)
+
+	sigCh := opt.Signals
+	var stopSignal func()
+	if sigCh == nil {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		sigCh = ch
+		stopSignal = func() { signal.Stop(ch) }
+	}
+	if stopSignal != nil {
+		defer stopSignal()
+	}
+
+	// テストの決定性のため、Run はシグナル監視を開始する時点で Options.Signals に既に入っているシグナルを同期的に取り込む
+	select {
+	case sig, ok := <-sigCh:
+		if ok && sig != nil {
+			tracker.set(sig)
+			cancel()
+		}
+	default:
+	}
+
+	sigDone := make(chan struct{})
+	defer close(sigDone)
+	go func() {
+		select {
+		case sig, ok := <-sigCh:
+			if ok && sig != nil {
+				tracker.set(sig)
+				cancel()
+			}
+		case <-sigDone:
+		}
+	}()
 
 	return execute(ctx, cfg, opt, e, paths)
+}
+
+type sigKey struct{}
+
+type signalTracker struct {
+	mu  sync.Mutex
+	sig os.Signal
+}
+
+func (st *signalTracker) get() os.Signal {
+	if st == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.sig
+}
+
+func (st *signalTracker) set(sig os.Signal) {
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.sig == nil {
+		st.sig = sig
+	}
+}
+
+func contextWithSignal(ctx context.Context) (context.Context, *signalTracker) {
+	st := &signalTracker{}
+	return context.WithValue(ctx, sigKey{}, st), st
+}
+
+func signalFromContext(ctx context.Context) os.Signal {
+	if st, ok := ctx.Value(sigKey{}).(*signalTracker); ok {
+		return st.get()
+	}
+	return nil
+}
+
+func signalName(sig os.Signal) string {
+	switch sig {
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGTERM:
+		return "SIGTERM"
+	case syscall.SIGHUP:
+		return "SIGHUP"
+	default:
+		if sysSig, ok := sig.(syscall.Signal); ok {
+			return fmt.Sprintf("signal %d", int(sysSig))
+		}
+		return sig.String()
+	}
+}
+
+// waitQuotaSleep pauses for duration d or until ctx is cancelled.
+// In tests, sleepFor may be overridden to record or fake the wait.
+func waitQuotaSleep(ctx context.Context, d time.Duration) error {
+	if reflect.ValueOf(sleepFor).Pointer() != reflect.ValueOf(time.Sleep).Pointer() {
+		sleepFor(d)
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // cooldown sleeps out the remainder of the post-kill cooldown window if a kill
@@ -138,9 +253,57 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 	waited := false
 	for i := 0; ; {
 		model := models[i]
+		attemptStart := timeNow()
 		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
 
-		if rc == config.ExitRateLimited {
+		appendInterruptedIndex := func(sigExit int) {
+			end := timeNow()
+			attemptModel := model
+			if attemptModel == "" && r.Model != "" {
+				attemptModel = r.Model
+			}
+			rec := index.Record{
+				TSStart:         attemptStart.Format(time.RFC3339),
+				TSEnd:           end.Format(time.RFC3339),
+				DurationMS:      end.Sub(attemptStart).Milliseconds(),
+				ClaudeSessionID: opt.Getenv("CLAUDE_CODE_SESSION_ID"),
+				ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
+				ConversationID:  index.ConvPtr(r.ConversationID),
+				Continued:       cfg.Continued(),
+				Model:           attemptModel,
+				CWD:             effectiveWorkDir(cfg),
+				Prompt:          cfg.Prompt,
+				Artifacts:       []string{},
+				Sandbox:         cfg.Sandbox,
+				NetLog:          r.NetLog,
+				ExitCode:        sigExit,
+				ErrorClass:      "cancelled_by_signal",
+			}
+			index.Append(paths.IndexFile, rec)
+		}
+
+		if rc == config.ExitRateLimited && (r.Error == nil || r.Error.Reason != "cancelled_by_signal") {
+			// モデル fallback と `--wait-quota` の分岐に入る前にも `signalFromContext(ctx)` を確認し、受信済みなら同じ結果を返す
+			if sig := signalFromContext(ctx); sig != nil {
+				sigNum := 0
+				if sysSig, ok := sig.(syscall.Signal); ok {
+					sigNum = int(sysSig)
+				}
+				sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+				r.Error = &emit.Error{
+					Reason: "cancelled_by_signal",
+					Detail: signalName(sig),
+				}
+				r.ExitCode = sigExit
+				appendInterruptedIndex(sigExit)
+				r.Warnings = prependWarning(r.Warnings, preflight)
+				for _, w := range r.Warnings {
+					e.Note("warning: " + w)
+				}
+				e.Emit(r)
+				return sigExit
+			}
+
 			// Model fallback: try the next candidate from -m "A,B,...".
 			if i < len(models)-1 {
 				e.Note(fmt.Sprintf("rate_limited: %s が上限。次候補 %s で再試行します。",
@@ -154,7 +317,28 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 					limit := time.Duration(cfg.MaxQuotaWait) * time.Second
 					if d <= limit {
 						e.Note(fmt.Sprintf("--wait-quota: リセットまで %s 待機して再試行します。", d))
-						sleepFor(d)
+						if err := waitQuotaSleep(ctx, d); err != nil {
+							if sig := signalFromContext(ctx); sig != nil {
+								sigNum := 0
+								if sysSig, ok := sig.(syscall.Signal); ok {
+									sigNum = int(sysSig)
+								}
+								sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+								r.Error = &emit.Error{
+									Reason: "cancelled_by_signal",
+									Detail: signalName(sig),
+								}
+								r.ExitCode = sigExit
+								appendInterruptedIndex(sigExit)
+								r.Warnings = prependWarning(r.Warnings, preflight)
+								for _, w := range r.Warnings {
+									e.Note("warning: " + w)
+								}
+								e.Emit(r)
+								return sigExit
+							}
+							return rc
+						}
 						waited = true
 						if r.Error != nil {
 							r.Error.WaitedSec = int(d.Seconds())
@@ -309,10 +493,50 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	// grandchild keeps an inherited output pipe open — this only arises when
 	// Stderr is not a raw *os.File (e.g. the test harness); it is harmless in the
 	// production path where Stderr is os.Stderr.
-	cmd.Cancel = func() error { return killGroup(cmd.Process) }
+	var cancelCalled atomic.Bool
+	cmd.Cancel = func() error {
+		cancelCalled.Store(true)
+		return killGroup(cmd.Process)
+	}
 	cmd.WaitDelay = 2 * time.Second
 	if cfg.Workspace != "" {
 		cmd.Dir = cfg.Workspace // pin agy's cwd so RUN_COMMAND resolves correctly (issue #1)
+	}
+
+	if err := ctx.Err(); err != nil {
+		if sig := signalFromContext(ctx); sig != nil {
+			_ = bodyCap.Close()
+			sigNum := 0
+			if sysSig, ok := sig.(syscall.Signal); ok {
+				sigNum = int(sysSig)
+			}
+			sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+			r := emit.Result{
+				ExitCode: sigExit,
+				Error: &emit.Error{
+					Reason: "cancelled_by_signal",
+					Detail: signalName(sig),
+				},
+			}
+			rec := index.Record{
+				TSStart:         tsStart,
+				TSEnd:           timeNow().Format(time.RFC3339),
+				DurationMS:      timeNow().Sub(start).Milliseconds(),
+				ClaudeSessionID: opt.Getenv("CLAUDE_CODE_SESSION_ID"),
+				ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
+				Continued:       cfg.Continued(),
+				Model:           model,
+				CWD:             effectiveWorkDir(cfg),
+				Prompt:          cfg.Prompt,
+				Artifacts:       []string{},
+				Sandbox:         cfg.Sandbox,
+				NetLog:          netLogPath,
+				ExitCode:        sigExit,
+				ErrorClass:      r.Error.Reason,
+			}
+			index.Append(paths.IndexFile, rec)
+			return r, sigExit, logFile
+		}
 	}
 
 	if serr := cmd.Start(); serr != nil {
@@ -333,6 +557,9 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	go func() { reasonCh <- w.Run(runCtx, func() { _ = killGroup(cmd.Process) }) }()
 
 	waitErr := cmd.Wait()
+	if afterWait != nil {
+		afterWait(ctx)
+	}
 	cancel()
 	reason := <-reasonCh
 	_ = bodyCap.Close()
@@ -413,6 +640,24 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 		return r, rc, logFile
 	}
 
+	// Cancelled by signal: agy-run received SIGINT/SIGTERM/SIGHUP and killed the agy process group.
+	if sig := signalFromContext(ctx); sig != nil && cancelCalled.Load() {
+		sigNum := 0
+		if sysSig, ok := sig.(syscall.Signal); ok {
+			sigNum = int(sysSig)
+		}
+		sigExit := config.ExitForSignal(syscall.Signal(sigNum))
+		r.Error = &emit.Error{
+			Reason: "cancelled_by_signal",
+			Detail: signalName(sig),
+		}
+		r.ExitCode = sigExit
+		rec.ExitCode = sigExit
+		rec.ErrorClass = r.Error.Reason
+		index.Append(paths.IndexFile, rec)
+		return r, sigExit, logFile
+	}
+
 	// body_file: copy the captured body to a stable per-conversation path.
 	if len(body) > 0 && convID != "" {
 		if dst, ok := copyBody(paths.LastBodyDir, convID, bodyPath); ok {
@@ -483,7 +728,11 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 	}
 
 	if rc != config.ExitOK && r.Error == nil {
-		r.Error = &emit.Error{Reason: "agy_error"}
+		errObj := &emit.Error{Reason: "agy_error"}
+		if rc == 137 && waitErr != nil {
+			errObj.Detail = waitErr.Error()
+		}
+		r.Error = errObj
 	}
 
 	r.ExitCode = rc
@@ -732,7 +981,7 @@ func exitCode(cmd *exec.Cmd, waitErr error, reason watchdog.Reason) int {
 	if waitErr == nil {
 		return 0
 	}
-	return 137 // killed by a signal we did not initiate
+	return 137 // agy-run はシグナルを受けておらず、agy だけが外から殺された
 }
 
 // copyBody copies the captured body to <lastBodyDir>/<conv>.md and returns the
