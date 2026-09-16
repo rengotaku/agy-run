@@ -1833,6 +1833,142 @@ func TestCase10_SignalBeforeFallbackPreventsNextCandidate(t *testing.T) {
 	}
 }
 
+func readAllIndexRecords(t *testing.T, home string) []index.Record {
+	t.Helper()
+	idxPath := filepath.Join(home, "data", "agy-run", "index.jsonl")
+	data, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatalf("read index file %s: %v", idxPath, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var recs []index.Record
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		var r index.Record
+		if err := json.Unmarshal([]byte(ln), &r); err != nil {
+			t.Fatalf("unmarshal index record %q: %v", ln, err)
+		}
+		recs = append(recs, r)
+	}
+	return recs
+}
+
+// Case 11: 中断結果が index.jsonl の最終行に残る
+func TestCase11_InterruptedRunAppendsIndexRecord(t *testing.T) {
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, home string) (config.Config, <-chan os.Signal)
+		wantModel string
+	}{
+		{
+			name: "fallback_pre_check",
+			setup: func(t *testing.T, home string) (config.Config, <-chan os.Signal) {
+				countFile := filepath.Join(t.TempDir(), "stub.count")
+				t.Setenv("STUB_RL_MODEL", "gemini-3.5-flash-high")
+				t.Setenv("STUB_COUNT_FILE", countFile)
+
+				sigCh := make(chan os.Signal, 1)
+				cfg, _, err := config.Parse([]string{"--no-sandbox", "-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "do task"}, os.Getenv)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+
+				afterWait = func(ctx context.Context) {
+					sigCh <- syscall.SIGTERM
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						if signalFromContext(ctx) != nil {
+							return
+						}
+						time.Sleep(20 * time.Millisecond)
+					}
+					t.Error("signal was not recorded in context within 2s")
+				}
+				t.Cleanup(func() { afterWait = nil })
+				return cfg, sigCh
+			},
+			wantModel: "gemini-3.5-flash-high",
+		},
+		{
+			name: "wait_quota_sleep",
+			setup: func(t *testing.T, home string) (config.Config, <-chan os.Signal) {
+				countFile := filepath.Join(t.TempDir(), "stub.count")
+				t.Setenv("STUB_RL_UNTIL", "1")
+				t.Setenv("STUB_RESET", "0h0m20s")
+				t.Setenv("STUB_COUNT_FILE", countFile)
+
+				sigCh := make(chan os.Signal, 1)
+				cfg, _, err := config.Parse([]string{"--no-sandbox", "-m", "gemini-3.5-flash-high", "--wait-quota", "do task"}, os.Getenv)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+
+				afterWait = func(ctx context.Context) {
+					go func() {
+						time.Sleep(300 * time.Millisecond)
+						sigCh <- syscall.SIGTERM
+					}()
+				}
+				t.Cleanup(func() { afterWait = nil })
+				return cfg, sigCh
+			},
+			wantModel: "gemini-3.5-flash-high",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := newHome(t)
+			cfg, sigCh := tc.setup(t, home)
+
+			var out, errb bytes.Buffer
+			opt := Options{
+				Stdout:  &out,
+				Stderr:  &errb,
+				Home:    home,
+				Getenv:  os.Getenv,
+				Signals: sigCh,
+			}
+
+			rc := Run(cfg, opt)
+			if rc != 143 {
+				t.Errorf("rc = %d, want 143", rc)
+			}
+
+			recs := readAllIndexRecords(t, home)
+			if len(recs) != 2 {
+				t.Fatalf("index records count = %d, want 2; got: %+v", len(recs), recs)
+			}
+
+			// 1つ前の行: error_class: "rate_limited", exit_code: 42
+			if recs[0].ErrorClass != "rate_limited" {
+				t.Errorf("first record error_class = %q, want \"rate_limited\"", recs[0].ErrorClass)
+			}
+			if recs[0].ExitCode != 42 {
+				t.Errorf("first record exit_code = %d, want 42", recs[0].ExitCode)
+			}
+
+			// 最終行: error_class: "cancelled_by_signal", exit_code: 143, conversation_id: stubConv, model: wantModel
+			last := recs[1]
+			if last.ErrorClass != "cancelled_by_signal" {
+				t.Errorf("last record error_class = %q, want \"cancelled_by_signal\"", last.ErrorClass)
+			}
+			if last.ExitCode != 143 {
+				t.Errorf("last record exit_code = %d, want 143", last.ExitCode)
+			}
+			if last.ConversationID == nil || *last.ConversationID != stubConv {
+				t.Errorf("last record conversation_id = %v, want %q", last.ConversationID, stubConv)
+			}
+			if last.Model != tc.wantModel {
+				t.Errorf("last record model = %q, want %q", last.Model, tc.wantModel)
+			}
+		})
+	}
+}
+
 
 
 

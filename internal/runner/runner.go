@@ -253,7 +253,34 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 	waited := false
 	for i := 0; ; {
 		model := models[i]
+		attemptStart := timeNow()
 		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
+
+		appendInterruptedIndex := func(sigExit int) {
+			end := timeNow()
+			attemptModel := model
+			if attemptModel == "" && r.Model != "" {
+				attemptModel = r.Model
+			}
+			rec := index.Record{
+				TSStart:         attemptStart.Format(time.RFC3339),
+				TSEnd:           end.Format(time.RFC3339),
+				DurationMS:      end.Sub(attemptStart).Milliseconds(),
+				ClaudeSessionID: opt.Getenv("CLAUDE_CODE_SESSION_ID"),
+				ChildSessionID:  opt.Getenv("CLAUDE_CODE_CHILD_SESSION"),
+				ConversationID:  index.ConvPtr(r.ConversationID),
+				Continued:       cfg.Continued(),
+				Model:           attemptModel,
+				CWD:             effectiveWorkDir(cfg),
+				Prompt:          cfg.Prompt,
+				Artifacts:       []string{},
+				Sandbox:         cfg.Sandbox,
+				NetLog:          r.NetLog,
+				ExitCode:        sigExit,
+				ErrorClass:      "cancelled_by_signal",
+			}
+			index.Append(paths.IndexFile, rec)
+		}
 
 		if rc == config.ExitRateLimited && (r.Error == nil || r.Error.Reason != "cancelled_by_signal") {
 			// モデル fallback と `--wait-quota` の分岐に入る前にも `signalFromContext(ctx)` を確認し、受信済みなら同じ結果を返す
@@ -268,6 +295,7 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 					Detail: signalName(sig),
 				}
 				r.ExitCode = sigExit
+				appendInterruptedIndex(sigExit)
 				r.Warnings = prependWarning(r.Warnings, preflight)
 				for _, w := range r.Warnings {
 					e.Note("warning: " + w)
@@ -301,6 +329,7 @@ func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitte
 									Detail: signalName(sig),
 								}
 								r.ExitCode = sigExit
+								appendInterruptedIndex(sigExit)
 								r.Warnings = prependWarning(r.Warnings, preflight)
 								for _, w := range r.Warnings {
 									e.Note("warning: " + w)
