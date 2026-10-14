@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/rengotaku/agy-run/internal/config"
 	"github.com/rengotaku/agy-run/internal/emit"
 	"github.com/rengotaku/agy-run/internal/index"
+	"github.com/rengotaku/agy-run/internal/slot"
 	"github.com/rengotaku/agy-run/internal/watchdog"
 )
 
@@ -43,6 +45,7 @@ const stubConv = "11111111-1111-1111-1111-111111111111"
 //	STUB_RESET     the "Resets in <dur>" value written on a rate-limit
 const stubAgy = `#!/bin/sh
 if [ "$1" = "models" ]; then
+  if [ -n "$STUB_MODELS_FAIL" ]; then exit 1; fi
   printf 'Fetching available models...\n'
   printf 'gemini-3.5-flash-high\tGemini 3.5 Flash (High)\n'
   printf 'gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n'
@@ -1968,6 +1971,298 @@ func TestCase11_InterruptedRunAppendsIndexRecord(t *testing.T) {
 		})
 	}
 }
+
+func setupModelsFile(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGY_RUN_MODELS_FILE", path)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	return path
+}
+
+// Case R1: 全候補が使える
+// 前提: impl=[gemini-3.5-flash-high, gemini-3.1-pro-high]
+// 手順: run(..., ["-m","@impl","hi"])
+// 期待挙動: rc=0、result.model=gemini-3.5-flash-high、dropped_models は無い
+// 検証観点: @ 参照の基本経路
+func TestR1_AllCandidatesAvailable(t *testing.T) {
+	home := newHome(t)
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.5-flash-high","gemini-3.1-pro-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Model != "gemini-3.5-flash-high" {
+		t.Errorf("result.model = %q, want gemini-3.5-flash-high", res.Model)
+	}
+	if len(res.DroppedModels) != 0 {
+		t.Errorf("dropped_models = %v, want empty/none", res.DroppedModels)
+	}
+}
+
+// Case R2: 消えた候補を外して走る
+// 前提: impl=[gemini-3.7-flash-high, gemini-3.5-flash-high]。STUB_COUNT_FILE で agy の起動回数を数える
+// 手順: run(..., ["-m","@impl","hi"])
+// 期待挙動: rc=0、result.model=gemini-3.5-flash-high、dropped_models=[gemini-3.7-flash-high]、本体の起動は 1 回（消えた候補で agy を起動していない）、stderr は空
+// 検証観点: 今回の停止そのもの。外した候補で無駄に起動するバグ、成功時 stderr の約束違反
+func TestR2_DropAbsentCandidates(t *testing.T) {
+	home := newHome(t)
+	countFile := filepath.Join(t.TempDir(), "count")
+	t.Setenv("STUB_COUNT_FILE", countFile)
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.5-flash-high"]}}`)
+	rc, stdout, stderr := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0 (stdout: %s, stderr: %s)", rc, stdout, stderr)
+	}
+	res := parseResult(t, stdout)
+	if res.Model != "gemini-3.5-flash-high" {
+		t.Errorf("result.model = %q, want gemini-3.5-flash-high", res.Model)
+	}
+	wantDropped := []string{"gemini-3.7-flash-high"}
+	if !reflect.DeepEqual(res.DroppedModels, wantDropped) {
+		t.Errorf("dropped_models = %v, want %v", res.DroppedModels, wantDropped)
+	}
+	cntBytes, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("failed to read count file: %v", err)
+	}
+	cnt := strings.TrimSpace(string(cntBytes))
+	if cnt != "1" {
+		t.Errorf("launch count = %q, want 1", cnt)
+	}
+	if stderr != "" {
+		t.Errorf("stderr = %q, want empty", stderr)
+	}
+}
+
+// Case R3: 全部消えている
+// 前提: impl=[gemini-3.7-flash-high, gemini-3.6-flash-high]、STUB_BODY="should not run"
+// 手順: run(..., ["-m","@impl","hi"])
+// 期待挙動: rc=2、reason=no_available_model、available_models に stub の 2 件、dropped_models に 2 件、body に "should not run" が無い
+// 検証観点: 全滅時に agy の既定モデルで走ってしまう fail-open
+func TestR3_AllCandidatesAbsent(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "should not run")
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.6-flash-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != 2 {
+		t.Fatalf("rc = %d, want 2 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "no_available_model" {
+		t.Fatalf("error.reason = %v, want no_available_model", res.Error)
+	}
+	wantAvail := []string{"gemini-3.5-flash-high", "gemini-3.1-pro-high"}
+	if !reflect.DeepEqual(res.Error.AvailableModels, wantAvail) {
+		t.Errorf("available_models = %v, want %v", res.Error.AvailableModels, wantAvail)
+	}
+	wantDropped := []string{"gemini-3.7-flash-high", "gemini-3.6-flash-high"}
+	if !reflect.DeepEqual(res.DroppedModels, wantDropped) {
+		t.Errorf("dropped_models = %v, want %v", res.DroppedModels, wantDropped)
+	}
+	if strings.Contains(res.Body, "should not run") {
+		t.Errorf("body contains 'should not run': %q", res.Body)
+	}
+}
+
+// Case R4: 外したあとのフォールバック
+// 前提: impl=[gemini-3.7-flash-high, gemini-3.5-flash-high, gemini-3.1-pro-high]、STUB_RL_MODEL=gemini-3.5-flash-high
+// 手順: run(..., ["-m","@impl","do it"])
+// 期待挙動: rc=0、result.model=gemini-3.1-pro-high、dropped_models=[gemini-3.7-flash-high]
+// 検証観点: 外す処理とレート制限時のフォールバックが両立すること
+func TestR4_FallbackAfterDropping(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_RL_MODEL", "gemini-3.5-flash-high")
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.5-flash-high","gemini-3.1-pro-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "do it"})
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Model != "gemini-3.1-pro-high" {
+		t.Errorf("result.model = %q, want gemini-3.1-pro-high", res.Model)
+	}
+	wantDropped := []string{"gemini-3.7-flash-high"}
+	if !reflect.DeepEqual(res.DroppedModels, wantDropped) {
+		t.Errorf("dropped_models = %v, want %v", res.DroppedModels, wantDropped)
+	}
+}
+
+// Case R5: 名前が無い
+// 前提: impl だけを定義
+// 手順: run(..., ["-m","@nope","hi"])
+// 期待挙動: rc=2、reason=unknown_model_alias、hint に impl が入る
+func TestR5_UnknownAlias(t *testing.T) {
+	home := newHome(t)
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.5-flash-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@nope", "hi"})
+	if rc != 2 {
+		t.Fatalf("rc = %d, want 2 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "unknown_model_alias" {
+		t.Fatalf("error.reason = %v, want unknown_model_alias", res.Error)
+	}
+	if !strings.Contains(res.Error.Hint, "impl") {
+		t.Errorf("error.hint %q does not contain 'impl'", res.Error.Hint)
+	}
+}
+
+// Case R6: models.json が無い
+// 前提: AGY_RUN_MODELS_FILE を存在しないパスに向ける
+// 手順: run(..., ["-m","@impl","hi"])
+// 期待挙動: rc=2、reason=models_file_error、detail にそのパスが入る
+// 検証観点: 設定が無いのに既定モデルで走る fail-open
+func TestR6_ModelsFileNotFound(t *testing.T) {
+	home := newHome(t)
+	nonExistent := filepath.Join(t.TempDir(), "non-existent-models.json")
+	t.Setenv("AGY_RUN_MODELS_FILE", nonExistent)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != 2 {
+		t.Fatalf("rc = %d, want 2 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "models_file_error" {
+		t.Fatalf("error.reason = %v, want models_file_error", res.Error)
+	}
+	if !strings.Contains(res.Error.Detail, nonExistent) {
+		t.Errorf("error.detail %q does not contain %q", res.Error.Detail, nonExistent)
+	}
+}
+
+// Case R7: モデル名の直書きは今までどおり厳しい
+// 前提: なし
+// 手順: run(..., ["-m","gemini-3.7-flash-high,gemini-3.5-flash-high","hi"])
+// 期待挙動: rc=2、reason=unknown_model、detail=gemini-3.7-flash-high
+// 検証観点: 緩める処理が直書きにまで漏れるバグ
+func TestR7_DirectModelStrict(t *testing.T) {
+	home := newHome(t)
+	rc, stdout, _ := run(t, home, []string{"-m", "gemini-3.7-flash-high,gemini-3.5-flash-high", "hi"})
+	if rc != 2 {
+		t.Fatalf("rc = %d, want 2 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "unknown_model" {
+		t.Fatalf("error.reason = %v, want unknown_model", res.Error)
+	}
+	if res.Error.Detail != "gemini-3.7-flash-high" {
+		t.Errorf("error.detail = %q, want gemini-3.7-flash-high", res.Error.Detail)
+	}
+}
+
+// Case R8: 一覧が取れないときは照合を飛ばす
+// 前提: stub に STUB_MODELS_FAIL=1 のとき models で exit 1 する分岐を足す。impl=[gemini-3.7-flash-high, gemini-3.5-flash-high]
+// 手順: run(..., ["-m","@impl","hi"])
+// 期待挙動: rc=0、result.model=gemini-3.7-flash-high（stub は任意のモデルを受け付ける）、dropped_models は無い
+// 検証観点: サンドボックス内など一覧が取れない環境で、全候補を外して止まるバグ
+func TestR8_SkipVerificationWhenModelsListFails(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_MODELS_FAIL", "1")
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.5-flash-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != 0 {
+		t.Fatalf("rc = %d, want 0 (stdout: %s)", rc, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Model != "gemini-3.7-flash-high" {
+		t.Errorf("result.model = %q, want gemini-3.7-flash-high", res.Model)
+	}
+	if len(res.DroppedModels) != 0 {
+		t.Errorf("dropped_models = %v, want empty/none", res.DroppedModels)
+	}
+}
+
+// 追加テスト: 不正なエイリアス構文（混在、空、不正文字）で invalid_model_alias (exit 2) になることの検証
+func TestExtra_R_InvalidAliasSyntax(t *testing.T) {
+	tests := []struct {
+		modelArg string
+	}{
+		{modelArg: "@impl,gemini-3.5-flash-high"},
+		{modelArg: "@"},
+		{modelArg: "@Impl!"},
+		{modelArg: "gemini-3.5-flash-high,@impl"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.modelArg, func(t *testing.T) {
+			home := newHome(t)
+			rc, stdout, _ := run(t, home, []string{"-m", tc.modelArg, "hi"})
+			if rc != 2 {
+				t.Fatalf("rc = %d, want 2 (stdout: %s)", rc, stdout)
+			}
+			res := parseResult(t, stdout)
+			if res.Error == nil || res.Error.Reason != "invalid_model_alias" {
+				t.Fatalf("error.reason = %v, want invalid_model_alias", res.Error)
+			}
+			if res.Error.Detail != tc.modelArg {
+				t.Errorf("error.detail = %q, want %q", res.Error.Detail, tc.modelArg)
+			}
+		})
+	}
+}
+
+// 追加テスト: 一部候補が drop され、残った候補もすべてレート制限で枯渇した場合に dropped_models が結果 JSON に残ることの検証
+func TestExtra_R_DroppedModels_InRateLimitExhausted(t *testing.T) {
+	home := newHome(t)
+	// gemini-3.5-flash-high をレート制限にする（残った唯一の候補）
+	t.Setenv("STUB_RL_MODEL", "gemini-3.5-flash-high")
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.5-flash-high"]}}`)
+	rc, stdout, _ := run(t, home, []string{"-m", "@impl", "hi"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want %d (rate_limited)", rc, config.ExitRateLimited)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "rate_limited" {
+		t.Fatalf("error.reason = %v, want rate_limited", res.Error)
+	}
+	wantDropped := []string{"gemini-3.7-flash-high"}
+	if !reflect.DeepEqual(res.DroppedModels, wantDropped) {
+		t.Errorf("dropped_models = %v, want %v", res.DroppedModels, wantDropped)
+	}
+}
+
+// 追加テスト: 候補を一部外した状態でスロット待ちがタイムアウトしたとき結果 JSON に dropped_models が残ることの検証
+func TestExtra_R_DroppedModels_InLockTimeout(t *testing.T) {
+	home := newHome(t)
+	// 並列数を 1 に設定
+	t.Setenv("AGY_RUN_MAX_CONCURRENCY", "1")
+	// models.json で一部候補が外れる設定（gemini-3.7-flash-high は存在しないため外れ、gemini-3.5-flash-high が残る）
+	setupModelsFile(t, `{"chains":{"impl":["gemini-3.7-flash-high","gemini-3.5-flash-high"]}}`)
+
+	// スロットディレクトリ（paths.StateDir = ~/.gemini/antigravity-cli）の唯一のスロットをテスト側で事前獲得しておく
+	slotDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(slotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h, ok, err := slot.Acquire(slotDir, 1, 0)
+	if err != nil || !ok {
+		t.Fatalf("setup: failed to acquire slot: ok=%v, err=%v", ok, err)
+	}
+	defer h.Release()
+
+	// 待ち時間は短く -w 0 を指定して即座にタイムアウトさせる
+	rc, stdout, _ := run(t, home, []string{"-w", "0", "-m", "@impl", "hi"})
+	if rc != config.ExitLockTimeout {
+		t.Fatalf("rc = %d, want %d (ExitLockTimeout), stdout: %s", rc, config.ExitLockTimeout, stdout)
+	}
+	res := parseResult(t, stdout)
+	if res.Error == nil || res.Error.Reason != "lock_timeout" {
+		t.Fatalf("error.reason = %v, want lock_timeout", res.Error)
+	}
+	wantDropped := []string{"gemini-3.7-flash-high"}
+	if !reflect.DeepEqual(res.DroppedModels, wantDropped) {
+		t.Errorf("dropped_models = %v, want %v", res.DroppedModels, wantDropped)
+	}
+}
+
+
+
 
 
 

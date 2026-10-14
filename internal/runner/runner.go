@@ -7,6 +7,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"github.com/rengotaku/agy-run/internal/convlog"
 	"github.com/rengotaku/agy-run/internal/emit"
 	"github.com/rengotaku/agy-run/internal/index"
+	"github.com/rengotaku/agy-run/internal/modelalias"
 	"github.com/rengotaku/agy-run/internal/ratelimit"
 	"github.com/rengotaku/agy-run/internal/runcmd"
 	"github.com/rengotaku/agy-run/internal/sandbox"
@@ -68,24 +70,86 @@ func Run(cfg config.Config, opt Options) int {
 	// a fresh machine (agy normally creates it, but do not depend on that).
 	_ = os.MkdirAll(paths.StateDir, 0o755)
 
-	// Guard 0: validate every -m candidate against the authoritative
-	// `agy models` list so a wrong model name fails fast (with the valid options
-	// in the result) instead of silently running on agy's fallback model.
-	// Best-effort: if the list cannot be obtained we skip validation.
+	// Guard 0: validate or resolve -m candidates.
+	// When -m starts with '@', resolve the alias against models.json, drop
+	// candidates absent from `agy models`, and pass the remaining chain to
+	// execution. Direct model names (@ absent) are strictly validated as before.
+	var resolvedModels []string
+	var droppedModels []string
+
 	if cfg.Model != "" {
-		if models, ok := listModels(paths.AgyBin); ok {
-			for _, m := range cfg.Models() {
-				if m != "" && !contains(models, m) {
-					e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
-						Reason:          "unknown_model",
-						Detail:          m,
-						AvailableModels: models,
-						Hint:            `-m は agy models の名称と完全一致が必要（kebab-case ID。例: "gemini-3.6-flash-high"）。カンマ区切りでフォールバック候補を並べられます。`,
-					}})
+		aliasName, isRef, err := modelalias.ParseRef(cfg.Model)
+		if err != nil {
+			e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+				Reason: "invalid_model_alias",
+				Detail: cfg.Model,
+			}})
+			return config.ExitUsage
+		}
+
+		if isRef {
+			modelsPath := modelalias.DefaultPath(opt.Getenv, opt.Home)
+			chains, err := modelalias.Load(modelsPath)
+			if err != nil {
+				e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+					Reason: "models_file_error",
+					Detail: err.Error(),
+				}})
+				return config.ExitUsage
+			}
+
+			chain, err := chains.Resolve(aliasName)
+			if err != nil {
+				var unknownErr *modelalias.UnknownAliasError
+				hint := ""
+				if errors.As(err, &unknownErr) {
+					hint = strings.Join(unknownErr.Known, ", ")
+				}
+				e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+					Reason: "unknown_model_alias",
+					Detail: aliasName,
+					Hint:   hint,
+				}})
+				return config.ExitUsage
+			}
+
+			if available, ok := listModels(paths.AgyBin); ok {
+				kept, dropped := modelalias.FilterAvailable(chain, available)
+				droppedModels = dropped
+				if len(kept) == 0 {
+					e.Emit(emit.Result{
+						ExitCode:      config.ExitUsage,
+						DroppedModels: dropped,
+						Error: &emit.Error{
+							Reason:          "no_available_model",
+							Detail:          "@" + aliasName,
+							AvailableModels: available,
+						},
+					})
 					return config.ExitUsage
 				}
+				resolvedModels = kept
+			} else {
+				resolvedModels = chain
 			}
+		} else {
+			if models, ok := listModels(paths.AgyBin); ok {
+				for _, m := range cfg.Models() {
+					if m != "" && !contains(models, m) {
+						e.Emit(emit.Result{ExitCode: config.ExitUsage, Error: &emit.Error{
+							Reason:          "unknown_model",
+							Detail:          m,
+							AvailableModels: models,
+							Hint:            `-m は agy models の名称と完全一致が必要（kebab-case ID。例: "gemini-3.6-flash-high"）。カンマ区切りでフォールバック候補を並べられます。`,
+						}})
+						return config.ExitUsage
+					}
+				}
+			}
+			resolvedModels = cfg.Models()
 		}
+	} else {
+		resolvedModels = cfg.Models()
 	}
 
 	// Guard 1: cooldown after a prior kill (avoids the exit-144 instant death).
@@ -94,15 +158,23 @@ func Run(cfg config.Config, opt Options) int {
 	// Guard 2: bounded-parallel concurrency slot.
 	h, ok, err := slot.Acquire(paths.SlotDir, cfg.MaxConcurrency, cfg.LockWait)
 	if err != nil {
-		e.Emit(emit.Result{ExitCode: config.ExitLockTimeout, Error: &emit.Error{
-			Reason: "slot_error", Detail: err.Error(),
-		}})
+		e.Emit(emit.Result{
+			ExitCode:      config.ExitLockTimeout,
+			DroppedModels: droppedModels,
+			Error: &emit.Error{
+				Reason: "slot_error", Detail: err.Error(),
+			},
+		})
 		return config.ExitLockTimeout
 	}
 	if !ok {
-		e.Emit(emit.Result{ExitCode: config.ExitLockTimeout, Error: &emit.Error{
-			Reason: "lock_timeout", WaitSec: cfg.LockWait, MaxConcurrency: cfg.MaxConcurrency,
-		}})
+		e.Emit(emit.Result{
+			ExitCode:      config.ExitLockTimeout,
+			DroppedModels: droppedModels,
+			Error: &emit.Error{
+				Reason: "lock_timeout", WaitSec: cfg.LockWait, MaxConcurrency: cfg.MaxConcurrency,
+			},
+		})
 		return config.ExitLockTimeout
 	}
 	defer h.Release()
@@ -153,7 +225,7 @@ func Run(cfg config.Config, opt Options) int {
 		}
 	}()
 
-	return execute(ctx, cfg, opt, e, paths)
+	return execute(ctx, cfg, opt, e, paths, resolvedModels, droppedModels)
 }
 
 type sigKey struct{}
@@ -246,15 +318,17 @@ func cooldown(e *emit.Emitter, killStamp string) {
 // emits the single result object exactly once. All physical agy runs happen
 // inside the already-acquired concurrency slot; only rate_limited triggers a
 // retry (fall to the next -m candidate, then optionally wait out the quota).
-func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitter, paths Paths) int {
+func execute(ctx context.Context, cfg config.Config, opt Options, e *emit.Emitter, paths Paths, models, droppedModels []string) int {
 	preflight := workspace.Preflight(effectiveWorkDir(cfg), paths.Settings)
 
-	models := cfg.Models()
 	waited := false
 	for i := 0; ; {
 		model := models[i]
 		attemptStart := timeNow()
 		r, rc, logFile := attempt(ctx, cfg, model, opt, e, paths)
+		if len(droppedModels) > 0 {
+			r.DroppedModels = droppedModels
+		}
 
 		appendInterruptedIndex := func(sigExit int) {
 			end := timeNow()
