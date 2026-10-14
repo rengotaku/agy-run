@@ -34,13 +34,27 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
 フラグ:
     -t  agy の --print-timeout（既定 240s。数値のみなら s を補完）。
         ※ agy 自身へ渡すだけ。外側の総枠は下記 idle/abs watchdog が別に効く
-    -m  モデル名。"agy models" の文字列と完全一致必須（kebab-case ID、"-" の位置まで）。
-        記憶で書かず迷ったら "agy models" を実行して正確な名前を取る。
-        不一致は実行前に exit 2 で弾き、error.available_models[] に候補を返す
-        （サイレントに別モデルで走ることはない）。未指定なら agy 既定モデル（--model も可）。
-        カンマ区切りでフォールバック候補を並べると、rate_limited 時に順に再試行し、
-        実際に使ったモデルを result.model に返す。
-        例: "gemini-3.6-flash-high" / "gemini-3.1-pro-high"
+    -m  モデル名または "@<名前>" によるエイリアス連鎖参照（--model も可）。
+        ・モデル名直書き:
+          "agy models" の文字列と完全一致必須（kebab-case ID、"-" の位置まで）。
+          不一致は実行前に exit 2 (reason: unknown_model) で弾き、error.available_models[] に候補を返す。
+          カンマ区切りでフォールバック候補を並べると、rate_limited 時に順に再試行し、
+          実際に使ったモデルを result.model に返す。未指定なら agy 既定モデル。
+          例: "gemini-3.8-flash-high" / "gemini-3.1-pro-high"
+        ・エイリアス連鎖参照 (-m @<名前>):
+          名前は [a-z0-9_-]+。models.json から候補リスト（chains）を引く。
+          models.json の探索順:
+            1. $AGY_RUN_MODELS_FILE
+            2. $XDG_CONFIG_HOME/agy-run/models.json
+            3. ~/.config/agy-run/models.json
+          形式: {"chains": {"<名前>": ["<モデル ID>", ...]}}
+          @ 参照のときだけ、"agy models" に無い候補を外して残りで実行し、
+          外した名前を結果 JSON の dropped_models に記録する（直書きでは外さず exit 2）。
+          @ 参照時の exit 2 の reason:
+            - invalid_model_alias: @ のみ、モデル名直書きとの混在、使用不能文字
+            - models_file_error:   models.json 不在、読取失敗、壊れた JSON、chains 不正
+            - unknown_model_alias: 指定した名前が chains に未定義（hint に定義済みエイリアスをソートして表示）
+            - no_available_model:  連鎖内の全候補が agy models に無く全滅
     -c  直近会話の継続
     -C  会話ID (<conversation-id>) を指定して継続（前回結果 JSON の conversation_id）
     -w  スロットロック待ち秒数（既定 240）。空きスロットを取れなければ exit 4
@@ -113,6 +127,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
       "body_file":            "本文の決定論的コピー先パス（純本文を読むならこのファイル）",
       "artifacts":            ["生成画像の絶対パス", ...],
       "model":                "実際に使用したモデル（-m 指定時）",
+      "dropped_models":       ["@ 参照で agy models に無く除外されたモデル", ...], // @ 参照時のみ
       "warnings":             ["非致命の警告（workspace 不一致 / RUN_COMMAND 失敗 / レート制限検出）", ...],
       "run_command_failures": 0,    // agy の build/test 失敗件数（>0 は自己申告要再検証）
       "net_log":              "/path/to/net-access.jsonl",  // sandbox 実行時のみ（既定 ON）
@@ -122,12 +137,14 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     例: agy-run "質問" 2>/dev/null | jq -r .body             # 本文だけ取り出す
         agy-run "質問" 2>/dev/null | jq -r .conversation_id  # 継続用 ID を取る
         agy-run -C <id> "続きの質問"                          # 同じ会話に追撃
-        agy-run -m "gemini-3.6-flash-high" -t 120s "軽い質問"
+        agy-run -m "@impl" -t 120s "軽い質問"                 # models.json の連鎖を参照
+        agy-run -m "gemini-3.8-flash-high" -t 120s "軽い質問" # モデル直接指定
         agy-run "質問" 2>/dev/null | jq -r '.artifacts[]'    # 生成画像のパス列挙
         agy-run "質問" 2>/dev/null | jq -r '.warnings[]?'    # 警告を列挙
 
 exit code:
-    0=成功 / 2=引数エラー / 4=スロットロック待ちタイムアウト /
+    0=成功 / 2=引数エラー（unknown_model / invalid_model_alias / models_file_error / unknown_model_alias / no_available_model 等） /
+    4=スロットロック待ちタイムアウト /
     42=レート制限（本文ゼロ＋ログに 429）/ 43=成果物生成失敗（成果物ツール呼出あり＋artifactsゼロ）/
     44=アイドルストール（heartbeat 途絶）/ 45=認証要求（非対話実行中に interactive OAuth 要求）/
     124=絶対上限タイムアウト /

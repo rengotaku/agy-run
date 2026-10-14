@@ -31,6 +31,10 @@ type Result struct {
 	// resolved fallback when -m carried a comma-separated list). Empty when the
 	// caller passed no -m (agy ran on its own default).
 	Model string `json:"model,omitempty"`
+	// DroppedModels lists model candidates removed from an alias chain (@name)
+	// because they were absent from `agy models`. Omitted when empty.
+	DroppedModels []string `json:"dropped_models,omitempty"`
+
 	// Warnings are non-fatal advisories that do not change exit_code: a
 	// workspace-mismatch preflight hint, or a "self-reported test-green is
 	// unverified" notice when agy's RUN_COMMAND steps failed.
