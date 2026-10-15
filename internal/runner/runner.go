@@ -35,7 +35,7 @@ import (
 	"github.com/rengotaku/agy-run/internal/workspace"
 )
 
-const authRequiredHint = "agy が非対話実行中に OAuth ログインを要求した。keyring (D-Bus) に届いていない可能性が高い。Claude Code の Bash sandbox 内で動いていないか確認する。sandbox.excludedCommands の `agy-run *` は単独のコマンドにしか一致せず、`cd X && agy-run ...` やパイプでつなぐと効かない。単独で呼んでも、環境変数を前に置く形や、プロンプトにバッククォートか `$(` を含む形は一致しない。cd の代わりに `-W <dir>` を使って agy-run を単独で呼ぶか、Bash ツールに dangerouslyDisableSandbox を付ける。手元でログインし直すなら引数なしで agy を起動する。"
+const authRequiredHint = "agy が非対話実行中に OAuth ログインを要求した。keyring (D-Bus) に届いていない可能性が高い。Claude Code の Bash sandbox 内で動いていないか確認する。sandbox.excludedCommands の `agy-run *` で外に出るのは、1 回の呼び出しの中のすべてのコマンドが excludedCommands に一致するときだけ。`cd X && agy-run ...` は cd が一致しないので外に出ない。環境変数を前に置く形、ファイルへのリダイレクト、プロンプトにバッククォートか `$(` を含む形もサンドボックス内に留まる。cd の代わりに `-W <dir>` を使って agy-run を単独で呼ぶか、Bash ツールに dangerouslyDisableSandbox を付ける。手元でログインし直すなら引数なしで agy を起動する。"
 
 // timeNow and sleepFor are overridable in tests; production uses the wall clock.
 var (
