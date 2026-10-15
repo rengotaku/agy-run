@@ -1111,7 +1111,7 @@ func TestE10(t *testing.T) {
 // Case 5: 実行中に一致行 + 本文 0 バイトなら kill して exit 45
 // 前提: newHome の stub agy。STUB_LOG_EXTRA = fixture 行、STUB_BODY 未設定（空）、STUB_SLEEP=10、AGY_RUN_POLL=1、AGY_RUN_IDLE_LIMIT=6
 // 手順: run(t, home, ["long task"]) を実行し所要時間を測る
-// 期待挙動: rc 45。結果 JSON の error.reason == "auth_required"、error.detail に triggering interactive OAuth を含む、error.hint に excludedCommands を含む。所要時間が 5 秒未満（idle limit 6 秒より前に止まった＝stall ではなく Probe で止まった証拠）。kill stamp（.agy-run.last-kill）が作られる。index.jsonl に "error_class":"auth_required" と "exit_code":45
+// 期待挙動: rc 45。結果 JSON の error.reason == "auth_required"、error.detail に triggering interactive OAuth を含む、error.hint に excludedCommands、「単独のコマンドにしか一致せず」、「-W <dir>」、「dangerouslyDisableSandbox」を含む。所要時間が 5 秒未満（idle limit 6 秒より前に止まった＝stall ではなく Probe で止まった証拠）。kill stamp（.agy-run.last-kill）が作られる。index.jsonl に "error_class":"auth_required" と "exit_code":45
 // 検証観点: 実行中検知が stall より先に効くこと。停止経路が stall と同じ後始末（kill stamp）を通ること
 func TestCase5_RunWatchdogKillsAuthRequired(t *testing.T) {
 	home := newHome(t)
@@ -1138,6 +1138,15 @@ func TestCase5_RunWatchdogKillsAuthRequired(t *testing.T) {
 	}
 	if !strings.Contains(r.Error.Hint, "excludedCommands") {
 		t.Errorf("error.hint = %q, want containing %q", r.Error.Hint, "excludedCommands")
+	}
+	if !strings.Contains(r.Error.Hint, "単独のコマンドにしか一致せず") {
+		t.Errorf("error.hint = %q, want containing %q", r.Error.Hint, "単独のコマンドにしか一致せず")
+	}
+	if !strings.Contains(r.Error.Hint, "-W <dir>") {
+		t.Errorf("error.hint = %q, want containing %q", r.Error.Hint, "-W <dir>")
+	}
+	if !strings.Contains(r.Error.Hint, "dangerouslyDisableSandbox") {
+		t.Errorf("error.hint = %q, want containing %q", r.Error.Hint, "dangerouslyDisableSandbox")
 	}
 	if elapsed >= 5*time.Second {
 		t.Errorf("elapsed = %v, want < 5s (Probe stopped before 6s idle limit)", elapsed)
