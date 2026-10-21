@@ -18,7 +18,7 @@
 - **workspace 不一致の preflight 警告**: feature worktree から呼んだ差分が trusted workspace(main) に落ちる状況を検出し `warnings` に出力
 - **RUN_COMMAND 監査**: agy の build/test 失敗をログから拾い `run_command_failures` / `warnings` に出す（自己申告「テスト緑」の誤信防止）
 - **非空本文でのレート制限警告**: 本文が返っているがログに 429（レート制限）の兆候がある場合、`exit_code` や `error` は変更せず `warnings` に記録する（調査タスク等での誤検知による中断を防ぎつつレート制限を可視化）
-- **同一ツールの空転検出**: 成果物が生成されないまま同一ツールが繰り返し呼び出された場合（既定 10 回, `AGY_RUN_TOOL_REPEAT_LIMIT`）、`warnings` に空転時間とともに記録する（実行は止めない）
+- **成果物ツールの空転検出**: 画像成果物が生成されないまま成果物を作るツール（`generate_image`）が繰り返し呼び出された場合（既定 10 回, `AGY_RUN_TOOL_REPEAT_LIMIT`）、`warnings` に空転時間とともに記録する（成果物ツール以外の連続では警告を出さない。実行は止めない）
 - **成果物欠落検知**: 成果物生成ツール（`generate_image`）を実行したのに artifacts が 0 件の場合は `artifact_missing` として失敗扱い（`exit 43`）
 - **認証要求の即時検知**: 非対話 print mode 中に interactive OAuth 要求が出た場合（D-Bus 不達等）、タイムアウトまで待たずに即 kill → `exit 45` (`auth_required`)
 - **print timeout 検知**: agy が `--print-timeout` で時間切れになった場合をログから検出し、`exit 46` (`print_timeout`) を返す。途中までの本文と `conversation_id` は保持され、`-C` で続きを依頼可能

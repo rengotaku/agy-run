@@ -108,7 +108,7 @@ const usage = `agy-run: agy (Antigravity CLI) を安全に呼ぶラッパー (Go
     AGY_RUN_ABS_LIMIT        絶対上限秒（既定 3600 = 60分。超過で exit 124）
     AGY_RUN_POLL             watchdog ポーリング秒（既定 20）
     AGY_RUN_MAX_QUOTA_WAIT   --wait-quota の待機上限秒（既定 14400 = 4時間）
-    AGY_RUN_TOOL_REPEAT_LIMIT 同一ツール連続呼び出しの空転検出閾値（既定 10）
+    AGY_RUN_TOOL_REPEAT_LIMIT 成果物ツールの連続呼び出しによる空転検出閾値（既定 10）
     AGY_RUN_SANDBOX          sandbox の on/off（0/false で無効化、1/true/yes などで有効化）。
                              フラグ未指定時のみ参照（既定は ON）
     AGY_RUN_SANDBOX_RO_BINDS 追加の読み取り専用 bind（コロン区切り、存在しないパスは無視）
