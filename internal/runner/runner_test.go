@@ -968,7 +968,7 @@ func TestRunner_ToolStallWarning(t *testing.T) {
 	t0 := time.Now().Add(time.Second)
 	for i := 0; i < 12; i++ {
 		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
-		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
 	}
 	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
 
@@ -977,13 +977,13 @@ func TestRunner_ToolStallWarning(t *testing.T) {
 	t.Setenv("AGY_RUN_TOOL_REPEAT_LIMIT", "10")
 
 	rc, out, _ := run(t, home, []string{"do work"})
-	if rc != config.ExitOK {
-		t.Fatalf("rc = %d, want 0", rc)
+	if rc != config.ExitArtifactMissing {
+		t.Fatalf("rc = %d, want %d (artifact_missing)", rc, config.ExitArtifactMissing)
 	}
 	r := parseResult(t, out)
 	found := false
 	for _, w := range r.Warnings {
-		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+		if strings.Contains(w, "同一ツール (generate_image)") && strings.Contains(w, "12 回") {
 			found = true
 			break
 		}
@@ -1005,7 +1005,7 @@ func TestD7_StallExitStillDetectsToolRepeat(t *testing.T) {
 	t0 := time.Now().Add(time.Second)
 	for i := 0; i < 12; i++ {
 		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
-		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
 	}
 	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
 
@@ -1025,7 +1025,7 @@ func TestD7_StallExitStillDetectsToolRepeat(t *testing.T) {
 	}
 	found := false
 	for _, w := range r.Warnings {
-		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+		if strings.Contains(w, "同一ツール (generate_image)") && strings.Contains(w, "12 回") {
 			found = true
 			break
 		}
@@ -1047,7 +1047,7 @@ func TestD8_AbsTimeoutStillDetectsToolRepeat(t *testing.T) {
 	t0 := time.Now().Add(time.Second)
 	for i := 0; i < 12; i++ {
 		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
-		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"custom_tool"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"generate_image"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
 	}
 	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
 
@@ -1068,13 +1068,46 @@ func TestD8_AbsTimeoutStillDetectsToolRepeat(t *testing.T) {
 	}
 	found := false
 	for _, w := range r.Warnings {
-		if strings.Contains(w, "同一ツール (custom_tool)") && strings.Contains(w, "12 回") {
+		if strings.Contains(w, "同一ツール (generate_image)") && strings.Contains(w, "12 回") {
 			found = true
 			break
 		}
 	}
 	if !found {
 		t.Errorf("expected stall warning in warnings on abs_timeout exit, got warnings: %v", r.Warnings)
+	}
+}
+
+// S7: 本文あり、transcript に run_command を 12 回連続 -> 実行全体の結果でもコーディング系の連続で警告が出ない
+func TestS7_RunnerRunCommandNoWarning(t *testing.T) {
+	home := newHome(t)
+	logDir := filepath.Join(home, ".gemini", "antigravity-cli", "brain", stubConv, ".system_generated", "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var sb strings.Builder
+	t0 := time.Now().Add(time.Second)
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"run_command"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(filepath.Join(logDir, "transcript.jsonl"), []byte(sb.String()), 0o600)
+
+	t.Setenv("STUB_BODY", "some output")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("AGY_RUN_TOOL_REPEAT_LIMIT", "10")
+
+	rc, out, _ := run(t, home, []string{"do work"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "空転") {
+			t.Errorf("expected no stall warning in warnings, got: %v", r.Warnings)
+			break
+		}
 	}
 }
 

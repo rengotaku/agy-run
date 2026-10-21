@@ -361,6 +361,14 @@ func DetectToolStall(transcriptPath string, artifacts []string, threshold int, s
 			if name == "schedule" {
 				continue
 			}
+			if !ArtifactTools[name] {
+				updateMaxStall()
+				currentTool = ""
+				currentCount = 0
+				firstTime = time.Time{}
+				lastTime = time.Time{}
+				continue
+			}
 
 			if currentTool == "" {
 				currentTool = name

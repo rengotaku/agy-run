@@ -542,6 +542,148 @@ func TestD6_UnreadableTranscript(t *testing.T) {
 	}
 }
 
+// S1: run_command を 12 回連続 -> 成果物ツールではないツールでは警告しない
+func TestS1_RunCommandNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"run_command"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning for run_command, got %q", warn)
+	}
+}
+
+// S2: view_file を 12 回連続 -> 同上（別のツール名）
+func TestS2_ViewFileNoWarning(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	for i := 0; i < 12; i++ {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"view_file"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning for view_file, got %q", warn)
+	}
+}
+
+// S3: generate_image を 6 回、run_command を 1 回、generate_image を 6 回 -> 成果物ツールではないツールが連続を途切れさせる
+func TestS3_NonArtifactToolBreaksStreak(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	tools := make([]string, 0, 13)
+	for i := 0; i < 6; i++ {
+		tools = append(tools, "generate_image")
+	}
+	tools = append(tools, "run_command")
+	for i := 0; i < 6; i++ {
+		tools = append(tools, "generate_image")
+	}
+	for i, tool := range tools {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"%s"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, tool, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if warn != "" {
+		t.Errorf("expected no warning when streak is broken by run_command, got %q", warn)
+	}
+}
+
+// S4: generate_image を 6 回、schedule を 2 回、generate_image を 6 回 -> schedule は連続を途切れさせない
+func TestS4_ScheduleDoesNotBreakStreak(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	tools := make([]string, 0, 14)
+	for i := 0; i < 6; i++ {
+		tools = append(tools, "generate_image")
+	}
+	tools = append(tools, "schedule", "schedule")
+	for i := 0; i < 6; i++ {
+		tools = append(tools, "generate_image")
+	}
+	for i, tool := range tools {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"%s"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, tool, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if !strings.Contains(warn, "generate_image") || !strings.Contains(warn, "12 回") {
+		t.Errorf("expected warning mentioning generate_image and 12 回, got %q", warn)
+	}
+}
+
+// S5: run_command を 30 回、続けて generate_image を 10 回 -> 前に長い非成果物の連続があっても成果物ツールの連続だけを報告
+func TestS5_LongNonArtifactPrefixThenArtifactStall(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	tools := make([]string, 0, 40)
+	for i := 0; i < 30; i++ {
+		tools = append(tools, "run_command")
+	}
+	for i := 0; i < 10; i++ {
+		tools = append(tools, "generate_image")
+	}
+	for i, tool := range tools {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"%s"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, tool, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if !strings.Contains(warn, "generate_image") || !strings.Contains(warn, "10 回") || strings.Contains(warn, "run_command") {
+		t.Errorf("expected warning mentioning generate_image and 10 回 without run_command, got %q", warn)
+	}
+}
+
+// S6: generate_image を 12 回、続けて run_command を 1 回 -> 末尾の非成果物ツールで確定済みの連続が消えない
+func TestS6_TrailingNonArtifactToolKeepsStall(t *testing.T) {
+	dir := t.TempDir()
+	tp := filepath.Join(dir, "transcript.jsonl")
+
+	var sb strings.Builder
+	t0, _ := time.Parse(time.RFC3339, "2026-08-23T01:00:19Z")
+	tools := make([]string, 0, 13)
+	for i := 0; i < 12; i++ {
+		tools = append(tools, "generate_image")
+	}
+	tools = append(tools, "run_command")
+	for i, tool := range tools {
+		curTime := t0.Add(time.Duration(i) * time.Minute).Format(time.RFC3339)
+		fmt.Fprintf(&sb, `{"type":"PLANNER_RESPONSE","status":"DONE","created_at":"%s","tool_calls":[{"name":"%s"}],"content":"","thinking":"","source":"MODEL","step_index":%d}`+"\n", curTime, tool, i+1)
+	}
+	_ = os.WriteFile(tp, []byte(sb.String()), 0o600)
+
+	warn := DetectToolStall(tp, []string{}, 10, time.Time{})
+	if !strings.Contains(warn, "generate_image") || !strings.Contains(warn, "12 回") {
+		t.Errorf("expected warning mentioning generate_image and 12 回, got %q", warn)
+	}
+}
+
 
 
 

@@ -9,7 +9,7 @@
 | `main.go` | エントリポイント。CLI引数と環境変数のパース、ヘルプ表示、ホームディレクトリ取得、`runner.Run` の呼び出し、exit code によるプロセス終了の制御。 |
 | `internal/authreq` | 非対話 print mode 中に agy が interactive OAuth に遷移したことをログから検出。 |
 | `internal/config` | CLIフラグ（getopts互換）と環境変数の解析、Config構造体の構築、プログラム全体の exit code 定数および各種デフォルト値の定義。 |
-| `internal/convlog` | ログファイルからの会話ID抽出、`transcript.jsonl` や `settings.json` からの実効モデル解析、成果物ツール呼び出し回数のカウント、新規画像成果物の検出、同一ツール連続呼び出しによる空転（tool stall）検出。 |
+| `internal/convlog` | ログファイルからの会話ID抽出、`transcript.jsonl` や `settings.json` からの実効モデル解析、成果物ツール呼び出し回数のカウント、新規画像成果物の検出、成果物ツール連続呼び出しによる空転（tool stall）検出。 |
 | `internal/emit` | stdout に出力する単一の JSON オブジェクト (`Result`, `Error`) のエンコードと、stderr への人向け診断メッセージ出力の制御。 |
 | `internal/index` | 実行完了ごとに `index.jsonl` へ 1 行の JSON レコードを追記。ファイル権限 (0600) の強制および容量超過時のローテーション（`.1`, `.2`, `.3`）制御。 |
 | `internal/printtimeout` | agy が `--print-timeout` で時間切れ終了したことをログから検出。 |
@@ -134,7 +134,7 @@
 - `transcript.jsonl` (`brain/<conv_id>/.system_generated/logs/transcript.jsonl`)
   `ExtractModelFromTranscript` 関数が `USER_SETTINGS_CHANGE` イベント内の `Model Selection`（例: `The user changed setting Model Selection from ... to <ModelName>`）を抽出し、使用されたモデルの表示名を取得する。
   `CountArtifactToolCalls` 関数が実行開始マーカー以降の `tool_calls` のうち、成果物生成ツール (`generate_image`) の呼び出し回数をカウントする。
-  `DetectToolStall` 関数が実行開始マーカー以降のツール呼び出し履歴を追跡し、同一ツール（`schedule` 除外）が閾値 (`AGY_RUN_TOOL_REPEAT_LIMIT`、既定10) 以上連続して実行され成果物が 0 件の場合に空転警告文字列を生成する。
+  `DetectToolStall` 関数が実行開始マーカー以降のツール呼び出し履歴を追跡し、成果物を作る同一ツール（`schedule` 除外、非成果物ツールが挟まると連続リセット）が閾値 (`AGY_RUN_TOOL_REPEAT_LIMIT`、既定10) 以上連続して実行され成果物が 0 件の場合に空転警告文字列を生成する。
 - `settings.json` (`~/.gemini/antigravity-cli/settings.json`)
   `ExtractModelFromSettings` 関数が `"model"` フィールドを取得する。
 
@@ -161,7 +161,7 @@
 | `AGY_RUN_ABS_LIMIT` | 3600 | 絶対壁時計時間上限秒数 (60分)。超過で exit 124。 |
 | `AGY_RUN_POLL` | 20 | watchdog のポーリング間隔秒数。1未満は1へ補正。 |
 | `AGY_RUN_MAX_QUOTA_WAIT` | 14400 | `--wait-quota` 指定時の待機上限秒数 (4時間)。 |
-| `AGY_RUN_TOOL_REPEAT_LIMIT` | 10 | 同一ツールの連続呼び出しによる空転検出の閾値回数。 |
+| `AGY_RUN_TOOL_REPEAT_LIMIT` | 10 | 成果物ツールの同一連続呼び出しによる空転検出の閾値回数。 |
 | `AGY_RUN_SANDBOX` | 1 (ON) | サンドボックスの有効化/無効化。`0` または `false` で無効化。CLIフラグ (`--sandbox`/`--no-sandbox`) が優先。 |
 | `AGY_RUN_SANDBOX_RO_BINDS` | (空) | サンドボックス内に追加する読み取り専用 bind パス一覧（コロン区切り）。 |
 | `AGY_RUN_SANDBOX_RW_BINDS` | (空) | サンドボックス内に追加する書き込み可能 bind パス一覧（コロン区切り）。 |
