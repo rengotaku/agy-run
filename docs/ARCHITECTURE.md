@@ -12,6 +12,7 @@
 | `internal/convlog` | ログファイルからの会話ID抽出、`transcript.jsonl` や `settings.json` からの実効モデル解析、成果物ツール呼び出し回数のカウント、新規画像成果物の検出、同一ツール連続呼び出しによる空転（tool stall）検出。 |
 | `internal/emit` | stdout に出力する単一の JSON オブジェクト (`Result`, `Error`) のエンコードと、stderr への人向け診断メッセージ出力の制御。 |
 | `internal/index` | 実行完了ごとに `index.jsonl` へ 1 行の JSON レコードを追記。ファイル権限 (0600) の強制および容量超過時のローテーション（`.1`, `.2`, `.3`）制御。 |
+| `internal/printtimeout` | agy が `--print-timeout` で時間切れ終了したことをログから検出。 |
 | `internal/ratelimit` | agy ログ内のレート制限/過負荷シグネチャのカウントおよび `Resets in ...` からの再試行待ち時間のパース。 |
 | `internal/runcmd` | agy ログから `CORTEX_STEP_TYPE_RUN_COMMAND` (build/test) ステップの失敗メッセージを検出。 |
 | `internal/runner` | 全体の実行制御。起動元プロセスグループからの切り離し、スロット取得、クールダウン処理、bwrap / netlog の準備、agy プロセスの起動と watchdog 監視、エラー判定と分類、フォールバック/クォータ待機ループ、結果の emit と index 追記の統括。 |
@@ -41,7 +42,7 @@
 8. 結果の収集とログ解析
    `internal/convlog` パッケージが会話 ID、新規生成画像、実効モデル、ツール空転を判定する。`internal/runcmd` パッケージが build/test の失敗行をスキャンする。`internal/ratelimit` パッケージがレート制限ヒット数とリセット時間を抽出する。`internal/workspace` パッケージが作業ツリーの不一致警告を生成する。
 9. 失敗の分類と再試行制御
-   `internal/runner` パッケージが規定の優先順位に従ってエラー理由と exit code を決定する（watchdog 判定の直後に自力終了時の `auth_required` 判定、続いて `rate_limited`、`artifact_missing` 等）。`rate_limited` の場合は、`-m` の次候補モデルへの切替や `--wait-quota` による待機・再試行ループを実行する（`auth_required` はモデル切替を行わない）。
+   `internal/runner` パッケージが規定の優先順位に従ってエラー理由と exit code を決定する（watchdog 判定の直後に自力終了時の `auth_required` 判定、続いて `rate_limited`、`print_timeout`、`artifact_missing` 等）。`rate_limited` の場合は、`-m` の次候補モデルへの切替や `--wait-quota` による待機・再試行ループを実行する（`auth_required` や `print_timeout` はモデル切替を行わない）。
 10. 出力とインデックスへの記録
     `internal/index` パッケージが実行レコードを `index.jsonl` へ追記する（必要に応じて非ブロッキング flock によるファイルローテーションを実施）。最後に `internal/emit` パッケージが stdout に単一の JSON オブジェクトを出力する。
 
@@ -68,7 +69,7 @@
 
 | フィールド | 型 | 必須/任意 | 意味・内容 |
 | --- | --- | --- | --- |
-| `reason` | string | 必須 | エラーの分類理由（例: `bad_option`, `missing_prompt`, `rate_limited`, `artifact_missing`, `stall`, `timeout`, `lock_timeout`, `unknown_model`, `agy_error`, `empty_output` 等）。 |
+| `reason` | string | 必須 | エラーの分類理由（例: `bad_option`, `missing_prompt`, `rate_limited`, `print_timeout`, `artifact_missing`, `stall`, `timeout`, `lock_timeout`, `unknown_model`, `agy_error`, `empty_output` 等）。 |
 | `detail` | string | 任意 (`omitempty`) | 詳細メッセージやスタックトレーステキスト。 |
 | `hint` | string | 任意 (`omitempty`) | 対処法のヒント。 |
 | `note` | string | 任意 (`omitempty`) | 補足事項。 |
@@ -95,6 +96,7 @@
 | `ExitArtifactMissing` | 43 | `rate_limited` でない場合において、`transcript.jsonl` 上で成果物生成ツール (`generate_image`) の呼び出し記録があるにもかかわらず、成果物ファイルが 0 件の場合。 |
 | `ExitStall` | 44 | アイドル watchdog が判定。ハートビート (ログ・本文・`transcript.jsonl` の最新 mtime) の更新が `AGY_RUN_IDLE_LIMIT` 秒間途絶えた場合。 |
 | `ExitAuthRequired` | 45 | 非対話 print mode 中に agy が interactive OAuth を要求（一致行あり）かつ本文が 0 バイトの場合。実行中の watchdog kill、またはプロセス終了後の分類で発生。 |
+| `ExitPrintTimeout` | 46 | agy が `--print-timeout` で時間切れ終了（一致行あり）。agy 自身の exit code にかかわらず設定。本文・conversation_id は保持。 |
 | `ExitAbsTimeout` | 124 | 絶対 watchdog が判定。実行開始からの経過時間が `AGY_RUN_ABS_LIMIT` 秒を超過した場合。 |
 | - | 128+シグナル番号 | agy-run 自身が SIGINT(130) / SIGTERM(143) / SIGHUP(129) を受信し、agy プロセスグループを停止した場合 (`cancelled_by_signal`)。 |
 | - | 137 | agy-run はシグナルを受けておらず、agy だけが外から殺された（detail に waitErr）。 |
@@ -112,11 +114,13 @@
    ログ内に `printmode\.go:\d+\] Print mode: triggering interactive OAuth$` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitAuthRequired` (45), `Reason: "auth_required"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` に記録する。
 4. レート制限判定 (`rate_limited`)
    エラーが未設定の場合に判定する。ログ内に `429|overloaded|rate.?limit|resource_exhausted|quota` に一致する行が存在し、かつ本文が 0 バイトであれば `rc = ExitRateLimited` (42), `Reason: "rate_limited"` を設定する。本文が存在する場合は `exit_code` や `r.Error` を変更せず、`warnings` にヒット件数を記録する。
-5. 成果物生成失敗判定 (`artifact_missing`)
+5. タイムアウト判定 (`print_timeout`)
+   エラーが未設定の場合に判定する。ログ内に `poll\.go:\d+\] Print mode: print timeout after \S+ with turn in progress` に一致する行が存在すれば `rc = ExitPrintTimeout` (46), `Reason: "print_timeout"`, `Detail: 該当行`, `PrintTimeout: cfg.PrintTimeout`, `Hint: 「agy が --print-timeout で止まりました。本文は途中までです。-C <conversation_id> で続きを依頼するか、-t を延ばしてください」` を設定する。agy 自身の終了コードにかかわらず rc は 46 固定となり、本文や conversation_id は破棄せず保持する。モデル fallback や `--wait-quota` は動作しない。
+6. 成果物生成失敗判定 (`artifact_missing`)
    エラーが未設定の場合に判定する。`transcript.jsonl` を解析し、実行開始時刻以降の成果物生成ツール (`generate_image`) 呼び出し数が 1 以上で、かつ検出成果物数が 0 の場合に `rc = ExitArtifactMissing` (43), `Reason: "artifact_missing"` を設定する。
-6. 空出力判定 (`empty_output`)
+7. 空出力判定 (`empty_output`)
    本文が 0 バイト、`rc == ExitOK` (0)、かつエラーが未設定の場合に `Reason: "empty_output"` を設定する。終了コード (`rc`) は 0 のまま維持する。
-7. 汎用エラー判定 (`agy_error`)
+8. 汎用エラー判定 (`agy_error`)
    `rc != ExitOK` (0) かつエラーが未設定の場合に `Reason: "agy_error"` を設定する（外から agy だけが殺された `rc == 137` の場合は `Detail` に `waitErr.Error()` が入る）。
 
 ## 6. transcript を読む機能 (internal/convlog)

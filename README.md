@@ -21,6 +21,7 @@
 - **同一ツールの空転検出**: 成果物が生成されないまま同一ツールが繰り返し呼び出された場合（既定 10 回, `AGY_RUN_TOOL_REPEAT_LIMIT`）、`warnings` に空転時間とともに記録する（実行は止めない）
 - **成果物欠落検知**: 成果物生成ツール（`generate_image`）を実行したのに artifacts が 0 件の場合は `artifact_missing` として失敗扱い（`exit 43`）
 - **認証要求の即時検知**: 非対話 print mode 中に interactive OAuth 要求が出た場合（D-Bus 不達等）、タイムアウトまで待たずに即 kill → `exit 45` (`auth_required`)
+- **print timeout 検知**: agy が `--print-timeout` で時間切れになった場合をログから検出し、`exit 46` (`print_timeout`) を返す。途中までの本文と `conversation_id` は保持され、`-C` で続きを依頼可能
 - **実効モデルの記録**: `index.jsonl` の `model` には「`-m` 指定時はその値 / 解決できれば kebab-case ID / 対応表に無ければ表示名のまま / どれも取れなければ `(unresolved)`」を記録
 
 - **出力契約**: stdout=結果 JSON、stderr=人向けメタのみ
@@ -100,6 +101,23 @@ stdout には常に 1 つの JSON オブジェクトが出力されます。
   "error": null
 }
 ```
+
+### exit code とエラー reason の対応表
+
+| exit code | reason | 意味・発生条件 |
+| --- | --- | --- |
+| 0 | なし | 正常終了 |
+| 2 | `unknown_model`, `invalid_model_alias`, `models_file_error`, `unknown_model_alias`, `no_available_model` 等 | CLI 引数エラー / モデル名・エイリアス不正 |
+| 4 | `lock_timeout` | スロットロック待ちタイムアウト（`-w` 秒以内に並列枠を獲得できず） |
+| 42 | `rate_limited` | レート制限（本文ゼロかつログに 429 等のシグネチャ） |
+| 43 | `artifact_missing` | 成果物生成失敗（成果物生成ツール呼出ありかつ artifacts ゼロ） |
+| 44 | `stall` | アイドルストール（ハートビート更新途絶） |
+| 45 | `auth_required` | 認証要求（非対話実行中に interactive OAuth 要求） |
+| 46 | `print_timeout` | agy の `--print-timeout` による時間切れ（ログに検出行あり。本文と conversation_id は保持） |
+| 124 | `timeout` | 絶対上限タイムアウト（`AGY_RUN_ABS_LIMIT` 秒超過） |
+| 129 / 130 / 143 | `cancelled_by_signal` | agy-run 自身が SIGHUP / SIGINT / SIGTERM を受信して中断 |
+| 137 | `agy_error` | agy プロセスが外部から強制終了された |
+| その他 | `agy_error` | agy 自身の非ゼロ終了コード |
 
 ## agy の書き込み先と worktree 併用（重要）
 
