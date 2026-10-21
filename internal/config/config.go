@@ -19,6 +19,7 @@ const (
 	ExitArtifactMissing  = 43  // artifact-generating tools called but zero artifacts written
 	ExitStall            = 44  // idle watchdog: heartbeat stalled past idle limit
 	ExitAuthRequired     = 45  // non-interactive run hit interactive OAuth prompt
+	ExitPrintTimeout     = 46  // agy exited due to --print-timeout
 	ExitAbsTimeout  = 124 // absolute wall-clock limit exceeded
 )
 

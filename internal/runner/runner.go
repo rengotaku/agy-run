@@ -27,6 +27,7 @@ import (
 	"github.com/rengotaku/agy-run/internal/emit"
 	"github.com/rengotaku/agy-run/internal/index"
 	"github.com/rengotaku/agy-run/internal/modelalias"
+	"github.com/rengotaku/agy-run/internal/printtimeout"
 	"github.com/rengotaku/agy-run/internal/ratelimit"
 	"github.com/rengotaku/agy-run/internal/runcmd"
 	"github.com/rengotaku/agy-run/internal/sandbox"
@@ -35,7 +36,10 @@ import (
 	"github.com/rengotaku/agy-run/internal/workspace"
 )
 
-const authRequiredHint = "agy が非対話実行中に OAuth ログインを要求した。keyring (D-Bus) に届いていない可能性が高い。Claude Code の Bash sandbox 内で動いていないか確認する。sandbox.excludedCommands の `agy-run *` で外に出るのは、1 回の呼び出しの中のすべてのコマンドが excludedCommands に一致するときだけ。`cd X && agy-run ...` は cd が一致しないので外に出ない。環境変数を前に置く形、ファイルへのリダイレクト、プロンプトにバッククォートか `$(` を含む形もサンドボックス内に留まる。cd の代わりに `-W <dir>` を使って agy-run を単独で呼ぶか、Bash ツールに dangerouslyDisableSandbox を付ける。手元でログインし直すなら引数なしで agy を起動する。"
+const (
+	authRequiredHint = "agy が非対話実行中に OAuth ログインを要求した。keyring (D-Bus) に届いていない可能性が高い。Claude Code の Bash sandbox 内で動いていないか確認する。sandbox.excludedCommands の `agy-run *` で外に出るのは、1 回の呼び出しの中のすべてのコマンドが excludedCommands に一致するときだけ。`cd X && agy-run ...` は cd が一致しないので外に出ない。環境変数を前に置く形、ファイルへのリダイレクト、プロンプトにバッククォートか `$(` を含む形もサンドボックス内に留まる。cd の代わりに `-W <dir>` を使って agy-run を単独で呼ぶか、Bash ツールに dangerouslyDisableSandbox を付ける。手元でログインし直すなら引数なしで agy を起動する。"
+	printTimeoutHint = "agy が --print-timeout で止まりました。本文は途中までです。-C <conversation_id> で続きを依頼するか、-t を延ばしてください"
+)
 
 // timeNow and sleepFor are overridable in tests; production uses the wall clock.
 var (
@@ -780,6 +784,20 @@ func attempt(ctx context.Context, cfg config.Config, model string, opt Options, 
 			r.Warnings = append(r.Warnings, fmt.Sprintf(
 				"本文は返っていますがログにレート制限の兆候があります (レート制限シグネチャのヒット数: %d)。exit_code は変更されていません。",
 				hits))
+		}
+	}
+
+	// Print-timeout classification: if agy stopped due to --print-timeout.
+	// Precedence: after watchdog kill, auth_required, rate_limited; before artifact_missing.
+	if ptLine, ok := printtimeout.Detect(logFile); ok {
+		if r.Error == nil {
+			r.Error = &emit.Error{
+				Reason:       "print_timeout",
+				Detail:       ptLine,
+				PrintTimeout: cfg.PrintTimeout,
+				Hint:         printTimeoutHint,
+			}
+			rc = config.ExitPrintTimeout
 		}
 	}
 

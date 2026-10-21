@@ -2279,6 +2279,259 @@ func TestExtra_R_DroppedModels_InLockTimeout(t *testing.T) {
 	}
 }
 
+const printTimeoutFixture = "W1016 16:44:11.396513       1 poll.go:188] Print mode: print timeout after 6m0s with turn in progress after 14216 polls (printed=803)"
+
+// Case R1: 本文あり（途中まで）、agy の終了コード 0、ログに fixture 行
+// 期待: rc == 46、error.reason == "print_timeout"、body が残る、conversation_id が残る、error.detail が fixture 行、error.print_timeout が 240s、error.hint に -C を含む
+// 検証観点: 本文があっても時間切れを隠さない
+func TestR1_PrintTimeoutWithBody(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+	if !strings.Contains(r.Body, "途中まで") {
+		t.Errorf("r.Body = %q, want containing %q", r.Body, "途中まで")
+	}
+	if r.ConversationID == "" {
+		t.Errorf("r.ConversationID is empty, want non-empty")
+	}
+	if r.Error.Detail != printTimeoutFixture {
+		t.Errorf("r.Error.Detail = %q, want %q", r.Error.Detail, printTimeoutFixture)
+	}
+	if r.Error.PrintTimeout != "240s" {
+		t.Errorf("r.Error.PrintTimeout = %q, want %q", r.Error.PrintTimeout, "240s")
+	}
+	if !strings.Contains(r.Error.Hint, "-C") {
+		t.Errorf("r.Error.Hint = %q, want to contain '-C'", r.Error.Hint)
+	}
+}
+
+// Case R2: 本文ゼロ、終了コード 0、ログに fixture 行
+// 期待: rc == 46、error.reason == "print_timeout"（empty_output ではない）
+// 検証観点: 本文ゼロの時間切れが empty_output に埋もれない
+func TestR2_PrintTimeoutEmptyBody(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+}
+
+// Case R3: 本文ゼロ、ログに fixture 行と 429 のシグネチャ
+// 期待: rc == 42、error.reason == "rate_limited"
+// 検証観点: 42 の意味を変えない（呼び出し側のフォールバックが依存）
+func TestR3_RateLimitedPrecedesPrintTimeoutWhenEmptyBody(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture+"\nHTTP 429 resource_exhausted. Resets in 0h0m1s")
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitRateLimited {
+		t.Fatalf("rc = %d, want %d (ExitRateLimited)", rc, config.ExitRateLimited)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "rate_limited" {
+		t.Fatalf("expected rate_limited error, got %+v", r.Error)
+	}
+}
+
+// Case R4: 本文あり、ログに fixture 行と 429 のシグネチャ
+// 期待: rc == 46、warnings に既存のレート制限の警告が残る
+// 検証観点: 警告を落とさない
+func TestR4_PrintTimeoutWithBodyPreservesRateLimitWarnings(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture+"\nHTTP 429 resource_exhausted. Resets in 0h0m1s")
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+	found := false
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "レート制限の兆候") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected warning containing 'レート制限の兆候', got warnings: %v", r.Warnings)
+	}
+}
+
+// Case R5: 本文ゼロ、ログに interactive OAuth の行と fixture 行
+// 期待: rc == 45、error.reason == "auth_required"
+// 検証観点: 認証要求が優先
+func TestR5_AuthRequiredPrecedesPrintTimeout(t *testing.T) {
+	home := newHome(t)
+	const authFixture = "ERROR: logging before google.Init: I0907 21:31:30.280284       1 printmode.go:387] Print mode: triggering interactive OAuth"
+	t.Setenv("STUB_BODY", "")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", authFixture+"\n"+printTimeoutFixture)
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitAuthRequired {
+		t.Fatalf("rc = %d, want %d (ExitAuthRequired)", rc, config.ExitAuthRequired)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "auth_required" {
+		t.Fatalf("expected auth_required error, got %+v", r.Error)
+	}
+}
+
+// Case R6: 本文あり、ログに user asked: "Print mode: print timeout after 8m0s with turn in progress" だけ
+// 期待: rc == 0、error == nil
+// 検証観点: 同じ語句の誤検知で既存の成功を壊さない
+func TestR6_FalsePositiveAvoided(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "completed answer")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", `user asked: "Print mode: print timeout after 8m0s with turn in progress"`)
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitOK {
+		t.Fatalf("rc = %d, want 0", rc)
+	}
+	r := parseResult(t, out)
+	if r.Error != nil {
+		t.Fatalf("expected error == nil, got %+v", r.Error)
+	}
+}
+
+// Case R7: R1 と同じ
+// 期待: index.jsonl の最新の行の error_class == "print_timeout"
+// 検証観点: 実行履歴に残る
+func TestR7_RecordedInIndex(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+
+	rc, _, _ := run(t, home, []string{"x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	rec := readLastIndexRecord(t, home)
+	if rec.ErrorClass != "print_timeout" {
+		t.Errorf("rec.ErrorClass = %q, want 'print_timeout'", rec.ErrorClass)
+	}
+	if rec.ExitCode != config.ExitPrintTimeout {
+		t.Errorf("rec.ExitCode = %d, want %d", rec.ExitCode, config.ExitPrintTimeout)
+	}
+}
+
+// Case R8: -m に 2 候補、ログに fixture 行（STUB_COUNT_FILE で呼び出し回数を数える）
+// 期待: agy の呼び出しが 1 回だけ、rc == 46
+// 検証観点: 時間切れでフォールバックを回さない
+func TestR8_NoModelFallbackOnPrintTimeout(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+	cntFile := filepath.Join(home, "stub_count")
+	t.Setenv("STUB_COUNT_FILE", cntFile)
+
+	rc, _, _ := run(t, home, []string{"-m", "gemini-3.5-flash-high,gemini-3.1-pro-high", "x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	cntData, err := os.ReadFile(cntFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	if strings.TrimSpace(string(cntData)) != "1" {
+		t.Errorf("STUB_COUNT_FILE = %q, want 1", string(cntData))
+	}
+}
+
+// Case R9: agy の終了コード 1、本文あり、ログに fixture 行
+// 期待: rc == 46
+// 検証観点: agy 自身の終了コードにかかわらず 46
+func TestR9_AgyNonZeroExitNormalizedToPrintTimeout(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "1")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+
+	rc, out, _ := run(t, home, []string{"x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+}
+
+// 追加テスト: TestExtra_R_NoWaitQuotaOnPrintTimeout / 検知するバグ: --wait-quota 指定時に print_timeout (46) でもクォータリセット待機に入ってしまうバグ
+func TestExtra_R_NoWaitQuotaOnPrintTimeout(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture+"\nHTTP 429 resource_exhausted. Resets in 0h1m0s")
+	cntFile := filepath.Join(home, "stub_count")
+	t.Setenv("STUB_COUNT_FILE", cntFile)
+
+	rc, out, _ := run(t, home, []string{"--wait-quota", "x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+	cntData, err := os.ReadFile(cntFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	if strings.TrimSpace(string(cntData)) != "1" {
+		t.Errorf("STUB_COUNT_FILE = %q, want 1", string(cntData))
+	}
+}
+
+// 追加テスト: TestExtra_R_CustomPrintTimeoutConfigPreserved / 検知するバグ: -t オプションで指定されたタイムアウト値が結果 JSON の error.print_timeout に反映されないバグ
+func TestExtra_R_CustomPrintTimeoutConfigPreserved(t *testing.T) {
+	home := newHome(t)
+	t.Setenv("STUB_BODY", "途中まで")
+	t.Setenv("STUB_EXIT", "0")
+	t.Setenv("STUB_LOG_EXTRA", printTimeoutFixture)
+
+	rc, out, _ := run(t, home, []string{"-t", "600s", "x"})
+	if rc != config.ExitPrintTimeout {
+		t.Fatalf("rc = %d, want %d (ExitPrintTimeout)", rc, config.ExitPrintTimeout)
+	}
+	r := parseResult(t, out)
+	if r.Error == nil || r.Error.Reason != "print_timeout" {
+		t.Fatalf("expected print_timeout error, got %+v", r.Error)
+	}
+	if r.Error.PrintTimeout != "600s" {
+		t.Errorf("r.Error.PrintTimeout = %q, want %q", r.Error.PrintTimeout, "600s")
+	}
+}
+
 
 
 
